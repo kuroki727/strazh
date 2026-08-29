@@ -2,10 +2,29 @@
 #define _GNU_SOURCE
 #endif
 
+#if __has_include(<cstdio>)
 #include <cstdio>
+#else
+#include <stdio.h>
+#endif
+
+#if __has_include(<cstdlib>)
 #include <cstdlib>
+#else
+#include <stdlib.h>
+#endif
+
+#if __has_include(<cerrno>)
 #include <cerrno>
+#else
+#include <errno.h>
+#endif
+
+#if __has_include(<csignal>)
 #include <csignal>
+#else
+#include <signal.h>
+#endif
 
 #include <unistd.h>
 #include <sys/types.h>
