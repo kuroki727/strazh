@@ -1,22 +1,28 @@
-#include <unistd.h>
-#ifdef __linux__
-#include <sys/mount.h>
+#if defined(__linux__)
+#  if __has_include(<unistd.h>) && __has_include(<sys/mount.h>)
+#    include <unistd.h>
+#    include <sys/mount.h>
+#  else
+#    error "Linux system headers are missing"
+#  endif
+#  include <stdio.h>
+#  include <string.h>
+#  include <errno.h>
+#  include <string>
+#else
+#  error "This program requires Linux"
 #endif
-#include <cstdio>
-#include <cstring>
-#include <cerrno>
-#include <string>
 
 namespace {
 
 bool do_mount(const std::string &source, const std::string &target,
               const char *fstype, unsigned long flags) {
     if (mount(source.c_str(), target.c_str(), fstype, flags, nullptr) == -1) {
-        std::fprintf(stderr, "[stage1] mount %s -> %s (%s) failed: %s\n",
-            source.c_str(), target.c_str(), fstype, std::strerror(errno));
+        fprintf(stderr, "[stage1] mount %s -> %s (%s) failed: %s\n",
+            source.c_str(), target.c_str(), fstype, strerror(errno));
         return false;
     }
-    std::fprintf(stderr, "[stage1] mounted %s at %s (%s)\n",
+    fprintf(stderr, "[stage1] mounted %s at %s (%s)\n",
         source.c_str(), target.c_str(), fstype);
     return true;
 }

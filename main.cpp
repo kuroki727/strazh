@@ -6,10 +6,12 @@
 #include <cstdlib>
 #include <cerrno>
 #include <csignal>
+
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
+#include <fcntl.h>
 
 #if __has_include(<sys/signalfd.h>)
 #include <sys/signalfd.h>
@@ -92,6 +94,7 @@ int main(int argc, char *argv[]) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
         std::perror("epoll_create1");
+        close(sfd);  // FIX: close sfd on error
         return 1;
     }
 
@@ -100,11 +103,15 @@ int main(int argc, char *argv[]) {
     ev.data.fd = sfd;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev) == -1) {
         std::perror("epoll_ctl");
+        close(epfd);  // FIX: close both fds on error
+        close(sfd);
         return 1;
     }
 
     pid_t stage1_pid = spawn_stage1(stage1_path);
     if (stage1_pid == -1) {
+        close(epfd);  // FIX: close both fds on error
+        close(sfd);
         return 1;
     }
 
