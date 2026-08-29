@@ -1,5 +1,7 @@
-#include <sys/mount.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/mount.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cerrno>

@@ -1,4 +1,17 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <sys/types.h>
+
+#if __has_include(<sys/signalfd.h>)
 #include <sys/signalfd.h>
+#elif __has_include(<linux/signalfd.h>)
+#include <linux/signalfd.h>
+#else
+#error "This program requires Linux signalfd support"
+#endif
+
 #include <sys/epoll.h>
 #include <sys/wait.h>
 #include <signal.h>
