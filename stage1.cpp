@@ -2,13 +2,13 @@
 #  if __has_include(<unistd.h>) && __has_include(<sys/mount.h>)
 #    include <unistd.h>
 #    include <sys/mount.h>
+#    include <stdio.h>
+#    include <string.h>
+#    include <errno.h>
+#    include <string>
 #  else
 #    error "Linux system headers are missing"
 #  endif
-#  include <stdio.h>
-#  include <string.h>
-#  include <errno.h>
-#  include <string>
 #else
 #  error "This program requires Linux"
 #endif
