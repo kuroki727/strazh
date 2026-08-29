@@ -2,7 +2,14 @@
 #define _GNU_SOURCE
 #endif
 
+#include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <csignal>
+#include <unistd.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/epoll.h>
 
 #if __has_include(<sys/signalfd.h>)
 #include <sys/signalfd.h>
@@ -11,13 +18,6 @@
 #else
 #error "This program requires Linux signalfd support"
 #endif
-
-#include <sys/epoll.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <unistd.h>
-#include <cstdio>
-#include <cerrno>
 
 namespace {
 
