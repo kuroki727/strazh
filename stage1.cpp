@@ -47,11 +47,11 @@ int main(int argc, char *argv[]) {
     ok &= do_mount("tmpfs", root + "/dev", "tmpfs", MS_NOSUID);
 
     const char *hostname = "myinit-test";
-    if (sethostname(hostname, static_cast<int>(std::strlen(hostname))) == -1) {
-        std::fprintf(stderr, "[stage1] sethostname failed: %s\n", std::strerror(errno));
+    if (sethostname(hostname, static_cast<int>(strlen(hostname))) == -1) {
+        fprintf(stderr, "[stage1] sethostname failed: %s\n", strerror(errno));
         ok = false;
     } else {
-        std::fprintf(stderr, "[stage1] hostname set to %s\n", hostname);
+        fprintf(stderr, "[stage1] hostname set to %s\n", hostname);
     }
 
     return ok ? 0 : 1;
