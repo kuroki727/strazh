@@ -21,6 +21,7 @@
 #include <map>
 #include <deque>
 #include <fstream>
+#include <sstream>
 #include <algorithm>
 #include <climits>
 
@@ -40,6 +41,8 @@ struct ServiceState {
     long long start_time_ms = 0;
     long long next_start_ms = 0;
     long long backoff_ms = 0;
+    bool disabled = false; // выключен вручную через control socket ('stop')
+    bool manual_action = false; // следующий SIGCHLD — от нашего же kill(), не краш
 };
 
 long long now_ms() {
@@ -261,6 +264,8 @@ std::string build_status_report(const std::vector<ServiceState> &services) {
         if (svc.pid != 0) {
             out += ": running pid=" + std::to_string(svc.pid) +
                    " uptime_ms=" + std::to_string(t - svc.start_time_ms);
+        } else if (svc.disabled) {
+            out += ": disabled";
         } else {
             long long wait_left = std::max<long long>(0, svc.next_start_ms - t);
             out += ": stopped next_start_in_ms=" + std::to_string(wait_left) +
@@ -272,7 +277,10 @@ std::string build_status_report(const std::vector<ServiceState> &services) {
     return out;
 }
 
-void handle_client(int client_fd, const std::vector<ServiceState> &services) {
+// pid_to_index нужен, чтобы 'stop'/'restart' сразу помечали слот в карте
+// как свободный, когда убивают ещё не пожатый процесс.
+void handle_client(int client_fd, std::vector<ServiceState> &services,
+                    const std::map<std::string, size_t> &name_to_index) {
     char buf[256];
     ssize_t r = recv(client_fd, buf, sizeof(buf) - 1, 0);
     if (r <= 0) {
@@ -281,13 +289,47 @@ void handle_client(int client_fd, const std::vector<ServiceState> &services) {
     }
     buf[r] = '\0';
 
-    std::string cmd(buf);
-    size_t end = cmd.find_first_of("\r\n");
-    if (end != std::string::npos) cmd = cmd.substr(0, end);
+    std::string line(buf);
+    size_t end = line.find_first_of("\r\n");
+    if (end != std::string::npos) line = line.substr(0, end);
+
+    std::istringstream iss(line);
+    std::string cmd, name;
+    iss >> cmd >> name;
 
     std::string response;
     if (cmd == "status") {
         response = build_status_report(services);
+    } else if (cmd == "stop" || cmd == "start" || cmd == "restart") {
+        auto it = name_to_index.find(name);
+        if (name.empty()) {
+            response = "ERR missing service name\n";
+        } else if (it == name_to_index.end()) {
+            response = "ERR unknown service '" + name + "'\n";
+        } else {
+            ServiceState &svc = services[it->second];
+            if (cmd == "stop") {
+                svc.disabled = true;
+                if (svc.pid != 0) {
+                    svc.manual_action = true;
+                    kill(svc.pid, SIGTERM); // сам реап обработает выход
+                }
+            } else if (cmd == "start") {
+                svc.disabled = false;
+                svc.backoff_ms = 0;
+                svc.next_start_ms = now_ms(); // старт при ближайшей возможности
+            } else { // restart
+                svc.disabled = false;
+                if (svc.pid != 0) {
+                    svc.manual_action = true;
+                    kill(svc.pid, SIGTERM); // респавн подхватит сам после реапа
+                } else {
+                    svc.backoff_ms = 0;
+                    svc.next_start_ms = now_ms();
+                }
+            }
+            response = "OK\n";
+        }
     } else {
         response = "ERR unknown command '" + cmd + "'\n";
     }
@@ -374,7 +416,7 @@ int main(int argc, char *argv[]) {
             timeout_ms = std::max<long long>(0, shutdown_deadline_ms - now_ms());
         } else {
             for (const auto &svc : services) {
-                if (svc.pid != 0) continue;
+                if (svc.pid != 0 || svc.disabled) continue;
                 long long wait_left;
                 if (dependencies_ready(svc, services, name_to_index)) {
                     wait_left = svc.next_start_ms - now_ms();
@@ -419,7 +461,7 @@ int main(int argc, char *argv[]) {
             if (fd == listen_fd) {
                 int client_fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
                 if (client_fd != -1) {
-                    handle_client(client_fd, services);
+                    handle_client(client_fd, services, name_to_index);
                 }
                 continue;
             }
@@ -468,16 +510,21 @@ int main(int argc, char *argv[]) {
 
                 if (shutting_down) continue;
 
-                if (ran_ms < kMinRuntimeMs) {
+                if (svc.manual_action) {
+                    svc.manual_action = false;
+                    svc.backoff_ms = 0;
+                    svc.next_start_ms = now_ms(); // команда, не краш — без штрафа
+                } else if (ran_ms < kMinRuntimeMs) {
                     svc.backoff_ms = (svc.backoff_ms == 0)
                         ? kInitialBackoffMs
                         : std::min(svc.backoff_ms * 2, kMaxBackoffMs);
                     std::fprintf(stderr, "[supervisor] %s crashed fast, backing off %lld ms\n",
                         svc.name.c_str(), svc.backoff_ms);
+                    svc.next_start_ms = now_ms() + svc.backoff_ms;
                 } else {
                     svc.backoff_ms = 0;
+                    svc.next_start_ms = now_ms();
                 }
-                svc.next_start_ms = now_ms() + svc.backoff_ms;
             }
         }
 
@@ -492,7 +539,7 @@ int main(int argc, char *argv[]) {
 
         long long t = now_ms();
         for (auto &svc : services) {
-            if (svc.pid == 0 && svc.next_start_ms <= t &&
+            if (svc.pid == 0 && !svc.disabled && svc.next_start_ms <= t &&
                 dependencies_ready(svc, services, name_to_index)) {
                 if (spawn_service(svc)) {
                     pid_to_index[svc.pid] = &svc - &services[0];
