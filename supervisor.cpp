@@ -10,6 +10,8 @@
 #include <sys/wait.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <signal.h>
 #include <time.h>
 #include <cerrno>
@@ -24,20 +26,20 @@
 
 namespace {
 
-constexpr long long kMinRuntimeMs = 1000;    // меньше — считаем "упал быстро"
+constexpr long long kMinRuntimeMs = 1000;
 constexpr long long kInitialBackoffMs = 500;
 constexpr long long kMaxBackoffMs = 30000;
-constexpr long long kShutdownGraceMs = 5000; // сколько ждать после SIGTERM перед SIGKILL
-constexpr long long kDependencyPollMs = 200; // как часто перепроверять неподнятую зависимость
+constexpr long long kShutdownGraceMs = 5000;
+constexpr long long kDependencyPollMs = 200;
 
 struct ServiceState {
     std::string name;
     std::string run_path;
-    std::vector<std::string> after; // имена сервисов, которые должны быть уже запущены
-    pid_t pid = 0;                  // 0 = сейчас не запущен
+    std::vector<std::string> after;
+    pid_t pid = 0;
     long long start_time_ms = 0;
-    long long next_start_ms = 0;    // когда можно (пере)запускать; учитывается только если pid == 0
-    long long backoff_ms = 0;       // текущий backoff после быстрого падения
+    long long next_start_ms = 0;
+    long long backoff_ms = 0;
 };
 
 long long now_ms() {
@@ -49,11 +51,10 @@ long long now_ms() {
 std::vector<std::string> read_after_file(const std::string &path) {
     std::vector<std::string> deps;
     std::ifstream f(path);
-    if (!f) return deps; // файла нет — зависимостей нет, это нормально
+    if (!f) return deps;
 
     std::string line;
     while (std::getline(f, line)) {
-        // обрезаем пробелы по краям
         size_t start = line.find_first_not_of(" \t\r\n");
         if (start == std::string::npos) continue;
         size_t end = line.find_last_not_of(" \t\r\n");
@@ -82,10 +83,10 @@ std::vector<ServiceState> discover_services(const std::string &services_dir) {
         std::string run_path = services_dir + "/" + name + "/run";
         struct stat st{};
         if (stat(run_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-            continue; // нет run или это не обычный файл (например, директория)
+            continue;
         }
         if (access(run_path.c_str(), X_OK) != 0) {
-            continue; // есть файл, но не исполняемый
+            continue;
         }
 
         ServiceState svc;
@@ -98,16 +99,12 @@ std::vector<ServiceState> discover_services(const std::string &services_dir) {
     return services;
 }
 
-// Топологическая сортировка по 'after' (Кан). Неизвестные зависимости и
-// циклы не роняют супервизор — только предупреждение и отказ от
-// соответствующего порядка/ограничения для затронутых сервисов.
 std::vector<ServiceState> resolve_order(std::vector<ServiceState> services) {
     std::map<std::string, size_t> name_to_index;
     for (size_t i = 0; i < services.size(); ++i) {
         name_to_index[services[i].name] = i;
     }
 
-    // Фильтруем неизвестные/самоссылающиеся зависимости.
     for (auto &svc : services) {
         std::vector<std::string> valid;
         for (const auto &dep : svc.after) {
@@ -159,7 +156,7 @@ std::vector<ServiceState> resolve_order(std::vector<ServiceState> services) {
             if (!placed[i]) {
                 if (!cycle_names.empty()) cycle_names += ", ";
                 cycle_names += services[i].name;
-                services[i].after.clear(); // иначе эти сервисы никогда не стартуют
+                services[i].after.clear();
             }
         }
         std::fprintf(stderr,
@@ -180,7 +177,7 @@ bool dependencies_ready(const ServiceState &svc, const std::vector<ServiceState>
                          const std::map<std::string, size_t> &name_to_index) {
     for (const auto &dep : svc.after) {
         auto it = name_to_index.find(dep);
-        if (it == name_to_index.end()) continue; // не должно случиться после resolve_order
+        if (it == name_to_index.end()) continue;
         if (services[it->second].pid == 0) return false;
     }
     return true;
@@ -222,10 +219,94 @@ int setup_signalfd() {
     return sfd;
 }
 
+// --- control socket ---
+
+int create_control_socket(const std::string &path) {
+    if (path.size() >= sizeof(sockaddr_un{}.sun_path)) {
+        std::fprintf(stderr, "[supervisor] control socket path too long: %s\n", path.c_str());
+        return -1;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+        std::perror("socket");
+        return -1;
+    }
+
+    unlink(path.c_str()); // подчищаем сокет от предыдущего (упавшего) запуска
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == -1) {
+        std::fprintf(stderr, "[supervisor] bind %s failed: %s\n", path.c_str(), std::strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 16) == -1) {
+        std::perror("listen");
+        close(fd);
+        return -1;
+    }
+    std::fprintf(stderr, "[supervisor] control socket listening at %s\n", path.c_str());
+    return fd;
+}
+
+std::string build_status_report(const std::vector<ServiceState> &services) {
+    std::string out;
+    long long t = now_ms();
+    for (const auto &svc : services) {
+        out += svc.name;
+        if (svc.pid != 0) {
+            out += ": running pid=" + std::to_string(svc.pid) +
+                   " uptime_ms=" + std::to_string(t - svc.start_time_ms);
+        } else {
+            long long wait_left = std::max<long long>(0, svc.next_start_ms - t);
+            out += ": stopped next_start_in_ms=" + std::to_string(wait_left) +
+                   " backoff_ms=" + std::to_string(svc.backoff_ms);
+        }
+        out += "\n";
+    }
+    if (out.empty()) out = "(no services)\n";
+    return out;
+}
+
+void handle_client(int client_fd, const std::vector<ServiceState> &services) {
+    char buf[256];
+    ssize_t r = recv(client_fd, buf, sizeof(buf) - 1, 0);
+    if (r <= 0) {
+        close(client_fd);
+        return;
+    }
+    buf[r] = '\0';
+
+    std::string cmd(buf);
+    size_t end = cmd.find_first_of("\r\n");
+    if (end != std::string::npos) cmd = cmd.substr(0, end);
+
+    std::string response;
+    if (cmd == "status") {
+        response = build_status_report(services);
+    } else {
+        response = "ERR unknown command '" + cmd + "'\n";
+    }
+
+    ssize_t written = 0;
+    while (written < static_cast<ssize_t>(response.size())) {
+        ssize_t w = write(client_fd, response.data() + written, response.size() - written);
+        if (w <= 0) break;
+        written += w;
+    }
+    close(client_fd);
+}
+
 } // namespace
 
 int main(int argc, char *argv[]) {
     std::string services_dir = (argc > 1) ? argv[1] : "/etc/sv";
+    std::string socket_path  = (argc > 2) ? argv[2] : "/run/strazh/supervisor.sock";
+
     std::fprintf(stderr, "[supervisor] starting as pid %d, services dir: %s\n",
         getpid(), services_dir.c_str());
 
@@ -248,10 +329,19 @@ int main(int argc, char *argv[]) {
 
     int sfd = setup_signalfd();
     if (sfd == -1) return 1;
+
+    int listen_fd = create_control_socket(socket_path);
+    // Отсутствие control socket — не фатально для первого шага: просто нет
+    // возможности спросить status, супервизор всё равно управляет сервисами.
+    if (listen_fd == -1) {
+        std::fprintf(stderr, "[supervisor] continuing without control socket\n");
+    }
+
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
         std::perror("epoll_create1");
         close(sfd);
+        if (listen_fd != -1) close(listen_fd);
         return 1;
     }
     epoll_event ev{};
@@ -261,26 +351,36 @@ int main(int argc, char *argv[]) {
         std::perror("epoll_ctl");
         close(epfd);
         close(sfd);
+        if (listen_fd != -1) close(listen_fd);
         return 1;
+    }
+    if (listen_fd != -1) {
+        epoll_event lev{};
+        lev.events = EPOLLIN;
+        lev.data.fd = listen_fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &lev) == -1) {
+            std::perror("epoll_ctl (listen_fd)");
+            close(listen_fd);
+            listen_fd = -1;
+        }
     }
 
     bool shutting_down = false;
     long long shutdown_deadline_ms = 0;
 
     for (;;) {
-        // --- считаем, сколько ждать в epoll_wait ---
-        long long timeout_ms = -1; // -1 = ждать бесконечно
+        long long timeout_ms = -1;
         if (shutting_down) {
             timeout_ms = std::max<long long>(0, shutdown_deadline_ms - now_ms());
         } else {
             for (const auto &svc : services) {
-                if (svc.pid != 0) continue; // уже запущен
+                if (svc.pid != 0) continue;
                 long long wait_left;
                 if (dependencies_ready(svc, services, name_to_index)) {
                     wait_left = svc.next_start_ms - now_ms();
                     if (wait_left < 0) wait_left = 0;
                 } else {
-                    wait_left = kDependencyPollMs; // зависимость ещё не поднята — перепроверим позже
+                    wait_left = kDependencyPollMs;
                 }
                 if (timeout_ms == -1 || wait_left < timeout_ms) timeout_ms = wait_left;
             }
@@ -314,6 +414,18 @@ int main(int argc, char *argv[]) {
         }
 
         for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+
+            if (fd == listen_fd) {
+                int client_fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+                if (client_fd != -1) {
+                    handle_client(client_fd, services);
+                }
+                continue;
+            }
+
+            if (fd != sfd) continue; // неизвестный fd, не должно происходить
+
             signalfd_siginfo si{};
             ssize_t r = read(sfd, &si, sizeof(si));
             if (r != static_cast<ssize_t>(sizeof(si))) continue;
@@ -378,7 +490,6 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // --- стартуем всех, у кого подошло время и подняты зависимости ---
         long long t = now_ms();
         for (auto &svc : services) {
             if (svc.pid == 0 && svc.next_start_ms <= t &&
@@ -392,6 +503,10 @@ int main(int argc, char *argv[]) {
 
     close(epfd);
     close(sfd);
+    if (listen_fd != -1) {
+        close(listen_fd);
+        unlink(socket_path.c_str());
+    }
     std::fprintf(stderr, "[supervisor] all services stopped, exiting\n");
     return 0;
 }
