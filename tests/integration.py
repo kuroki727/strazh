@@ -85,6 +85,23 @@ class ConnectionBackpressure(unittest.TestCase):
         create.assert_called_once()
         client.close.assert_called_once()
 
+    def test_startup_waits_for_reply_after_stale_socket(self):
+        harness = mock.Mock()
+        harness.process.poll.return_value = None
+        harness.raw.side_effect = [ConnectionRefusedError(errno.ECONNREFUSED, 'stale socket'),
+                                   b'OK\n(no services)\n']
+        with mock.patch.object(time, 'sleep'):
+            Harness.wait_socket(harness)
+        self.assertEqual(harness.raw.call_count, 2)
+
+    def test_startup_does_not_hide_invalid_response(self):
+        harness = mock.Mock()
+        harness.process.poll.return_value = None
+        harness.raw.return_value = b'ERR unexpected response\n'
+        with self.assertRaises(AssertionError):
+            Harness.wait_socket(harness)
+        harness.raw.assert_called_once()
+
 
 class Harness:
     def __init__(self):
@@ -118,9 +135,21 @@ class Harness:
         return self.process
 
     def wait_socket(self):
-        eventually(lambda: self.sock.exists() or self.process.poll() is not None)
-        if self.process.poll() is not None:
-            raise AssertionError('startup failed: ' + (self.root / 'supervisor.log').read_text())
+        def ready():
+            if self.process.poll() is not None:
+                raise AssertionError('startup failed: ' + (self.root / 'supervisor.log').read_text())
+            try:
+                response = self.raw(b'status\n')
+            except OSError as exc:
+                # A stale pathname can already exist before bind/listen. Only
+                # startup tolerates its absence or a not-yet-listening socket.
+                if exc.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                    return False
+                raise
+            if not response.startswith(b'OK\n'):
+                raise AssertionError('invalid supervisor readiness response: %r' % response)
+            return True
+        eventually(ready)
 
     def cli(self, *args, expected=0):
         result = subprocess.run([str(BIN / 'svctl'), *args], env=self.env,
