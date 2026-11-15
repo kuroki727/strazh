@@ -16,7 +16,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-format-18
-          git ls-files -z '*.cpp' '*.h' | xargs -0 clang-format-18 --dry-run --Werror
+          git ls-files -z '*.cpp' '*.h' | xargs -0 clang-format-18 -i
+          git diff --no-color --exit-code
           git diff --check HEAD^ HEAD
           python3 -m py_compile tests/integration.py tools/make-qemu-rootfs.py tools/qemu-smoke.py
           bash -n tools/publish-v0.1.0.sh
@@ -29,10 +30,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Verify write access without creating a tag or release
+      - name: Verify contents write without changing any reference
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api "repos/$GITHUB_REPOSITORY" --jq '.permissions.push' | grep -qx true
+        run: |
+          # An unreachable empty blob proves Contents: write; no branch/tag/release changes.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" \
+            -f content= -f encoding=utf-8 --jq .sha \
+            | grep -qx e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
