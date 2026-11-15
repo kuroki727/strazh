@@ -3,6 +3,36 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
+  source:
+    name: Source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Formatting, whitespace and script syntax
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format-18
+          git ls-files -z '*.cpp' '*.h' | xargs -0 clang-format-18 --dry-run --Werror
+          git diff --check HEAD^ HEAD
+          python3 -m py_compile tests/integration.py tools/make-qemu-rootfs.py tools/qemu-smoke.py
+          bash -n tools/publish-v0.1.0.sh
+          python3 tests/release_gate.py
+  release_permissions:
+    name: Release permission preflight
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Verify write access without creating a tag or release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY" --jq '.permissions.push' | grep -qx true
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -83,3 +113,19 @@ jobs:
           sha256sum "$STRAZH_QEMU_KERNEL" "$(command -v busybox)" rootfs.cpio.gz
       - name: Boot and verify service management and bounded shutdown
         run: python3 tools/qemu-smoke.py "$STRAZH_QEMU_KERNEL" rootfs.cpio.gz
+  publish:
+    name: Publish Strazh v0.1.0
+    needs: [source, release_permissions, test, qemu]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Annotate the verified merge and publish source-only release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/publish-v0.1.0.sh

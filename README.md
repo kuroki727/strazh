@@ -1,15 +1,27 @@
 # Strazh v0.1.0
 
-Strazh is a small Linux PID 1 and service supervisor in C++17. Services are
+Strazh is an experimental, minimalist Linux PID 1 and service supervisor in C++17. Services are
 plain directories with executable `run` files. Runtime dependencies are libc,
 libstdc++ and Linux syscalls; no third-party libraries or configuration language
 are required. A shell is needed only for services written as scripts.
 
-This tree is a **v0.1.0 MVP candidate**, not a claim of production readiness.
-Lifecycle and control components have automated tests. Named-socket integration
-and actual PID 1 boot validation must also pass before a stable release. See
-[the audit](docs/AUDIT.md), [validation results](docs/VALIDATION.md), and
-[VM instructions](docs/QEMU.md).
+v0.1.0 is the first experimental MVP release. Production readiness and
+compatibility with other init systems are not claimed. See [CHANGELOG.md](CHANGELOG.md),
+[the final audit](docs/RELEASE-AUDIT.md), [validation results](docs/VALIDATION.md),
+and [VM instructions](docs/QEMU.md).
+
+## Minimalist philosophy
+
+Do one thing well: initialize Linux, supervise foreground services, and provide
+explicit control. Keep PID 1 small and predictable, with initialization,
+supervision and control in separate executables. Plain service directories and
+existing Linux/POSIX interfaces keep configuration understandable and auditable.
+
+Every capability must justify its code complexity, memory use, process cost and
+startup latency. Networking, devices, sessions and log processing belong in
+separate tools. Strazh does not bundle those managers, D-Bus, plugins, a large
+configuration framework or a systemd compatibility layer. Correctness and
+measured reductions in overhead take priority over convenience features.
 
 ## Architecture
 
@@ -48,7 +60,11 @@ Use Linux with a C++17 compiler and CMake 3.16 or newer. Stage1's safe mount
 inspection needs Linux 5.8 or newer with mount-ID support and matching headers.
 Arch Linux's GCC and Clang are supported. No test tools are needed by default.
 
+The release contains source; no prebuilt binaries are provided.
+
 ```sh
+git clone --branch v0.1.0 --depth 1 https://github.com/kuroki727/strazh.git
+cd strazh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
 ```
@@ -235,10 +251,10 @@ architecture. Uninterruptible kernel tasks may outlive a shutdown deadline.
 
 ## Roadmap
 
-Before tagging v0.1.0: complete unrestricted integration and VM boot validation,
-review this change set, and record the exact toolchain/kernel/BusyBox inputs.
-Next releases: filesystem teardown and poweroff/reboot, an emergency recovery
-console, stronger service-tree containment, readiness and oneshot semantics,
-logging, configuration reload, and measured supervisor recovery.
+Prioritize PID 1 reliability, correct supervision and dependency behavior,
+predictable shutdown/restart, clear diagnostics, and measured idle overhead.
+Broaden VM fault testing before expanding supported deployment environments.
+Future capabilities require a separate justification of complexity and runtime
+cost; v0.1.0 deliberately preserves its four-executable architecture.
 
 MIT license. See [LICENSE](LICENSE).

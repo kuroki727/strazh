@@ -29,9 +29,16 @@ int main() {
     if (mode == "exit")
         return 7;
     if (mode == "grace") {
+        sigset_t blocked, original;
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGTERM);
+        if (sigprocmask(SIG_BLOCK, &blocked, &original) < 0)
+            return 95;
         signal(SIGTERM, count_term);
         while (!term_count)
-            pause();
+            sigsuspend(&original);
+        if (sigprocmask(SIG_SETMASK, &original, nullptr) < 0)
+            return 96;
         timespec delay{0, 200000000};
         while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {
         }
