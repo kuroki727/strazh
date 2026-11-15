@@ -2,9 +2,11 @@
 
 ## Release assessment
 
-The implementation remains an MVP candidate, not a production-readiness claim.
-The follow-up GitHub Actions runs now pass named-socket integration, leak
-detection and a real PID 1 QEMU boot smoke test. No merge, tag or release was made.
+Strazh v0.1.0 is an experimental MVP; production readiness is not claimed.
+The historical runs below establish integration, leak-detection and VM evidence.
+The [final engineering audit](RELEASE-AUDIT.md) defines the current release gates:
+each final candidate and the resulting main merge must pass the complete workflow
+before an annotated tag or GitHub Release may be published.
 
 Initial stabilization used a source snapshot from
 `a6fd544a4f91dff757618cebe6c118ee4b2d4dd6` because shell DNS prevented cloning.
@@ -163,8 +165,8 @@ critical defect remains in untested boot/integration paths.
    readiness/oneshot services, logging, reload and cgroup containment remain
    future work. Inherited console/log I/O is not managed; kernel stalls and
    uninterruptible tasks can exceed userspace shutdown policy deadlines.
-5. Create a release tag only after explicit review and approval. No production
-   readiness claim is justified by the current evidence.
+5. Preserve existing release tags and publish only verified source. Passing
+   these release gates does not establish production readiness.
 
 ## Files changed
 
