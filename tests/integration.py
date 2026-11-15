@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated integration tests. Never mount, reboot, or run init as host PID 1."""
 import concurrent.futures
+import errno
 import os
 from pathlib import Path
 import signal
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 BIN = Path(sys.argv.pop(1)).resolve()
 
@@ -30,6 +32,58 @@ def alive(pid):
         return Path('/proc/%d/stat' % pid).read_text().split()[2] != 'Z'
     except FileNotFoundError:
         return False
+
+
+def connect_unix(path, timeout=2):
+    """Retry only a full Unix listen queue, with fresh sockets and one deadline."""
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Unix socket connection backlog did not drain') from last_error
+        client = socket.socket(socket.AF_UNIX)
+        try:
+            client.settimeout(remaining)
+            client.connect(str(path))
+            return client
+        except OSError as exc:
+            client.close()
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            last_error = exc
+        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+
+
+class ConnectionBackpressure(unittest.TestCase):
+    def test_temporary_backlog_pressure_uses_fresh_socket(self):
+        busy, connected = mock.Mock(), mock.Mock()
+        busy.connect.side_effect = BlockingIOError(errno.EAGAIN, 'listen queue full')
+        with mock.patch.object(socket, 'socket', side_effect=[busy, connected]), \
+                mock.patch.object(time, 'sleep'):
+            self.assertIs(connect_unix('/test.sock'), connected)
+        busy.close.assert_called_once()
+        connected.close.assert_not_called()
+
+    def test_persistent_backlog_pressure_has_total_deadline(self):
+        busy = mock.Mock()
+        busy.connect.side_effect = BlockingIOError(errno.EAGAIN, 'listen queue full')
+        with mock.patch.object(socket, 'socket', return_value=busy) as create, \
+                mock.patch.object(time, 'monotonic', side_effect=[0, 0, 0.01, 0.02, 0.03, 0.04]), \
+                mock.patch.object(time, 'sleep'):
+            with self.assertRaises(TimeoutError):
+                connect_unix('/test.sock', timeout=0.025)
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(busy.close.call_count, 2)
+
+    def test_connection_refused_is_not_retried(self):
+        client = mock.Mock()
+        client.connect.side_effect = ConnectionRefusedError(errno.ECONNREFUSED, 'not listening')
+        with mock.patch.object(socket, 'socket', return_value=client) as create:
+            with self.assertRaises(ConnectionRefusedError):
+                connect_unix('/test.sock')
+        create.assert_called_once()
+        client.close.assert_called_once()
 
 
 class Harness:
@@ -76,9 +130,8 @@ class Harness:
         return result.stdout
 
     def raw(self, data):
-        with socket.socket(socket.AF_UNIX) as client:
+        with connect_unix(self.sock) as client:
             client.settimeout(4)
-            client.connect(str(self.sock))
             client.sendall(data)
             client.shutdown(socket.SHUT_WR)
             result = b''
@@ -324,13 +377,10 @@ class Integration(unittest.TestCase):
         idle.connect(str(h.sock))
         h.extra.append(idle)
         for _ in range(70):
-            client = socket.socket(socket.AF_UNIX)
-            client.settimeout(2)
-            try:
-                client.connect(str(h.sock))
+            with connect_unix(h.sock) as client:
                 client.sendall(b'status\n')
-            finally:
-                client.close()
+        # Require a real reply after the burst, not merely a successful connect.
+        self.assertEqual(h.raw(b'status\n'), b'OK\n(no services)\n')
         self.assertIn('OK\n', h.cli('status'))
         eventually(lambda: idle.recv(1024) == b'', timeout=4)
         h.stop()
@@ -373,7 +423,8 @@ class Integration(unittest.TestCase):
         stale = socket.socket(socket.AF_UNIX)
         stale.bind(str(h.sock))
         stale.close()
-        self.running()
+        h.start(preexec=lambda: os.umask(0))
+        h.wait_socket()
         self.assertEqual(h.sock.stat().st_mode & 0o777, 0o600)
         for path in (h.sock, h.root / 'other.sock'):
             p = subprocess.run([str(BIN / 'supervisor'), str(h.services), str(path)],
@@ -383,6 +434,12 @@ class Integration(unittest.TestCase):
             h.cli('status')
         h.stop()
         self.assertTrue(Path(str(h.sock) + '.lock').exists())
+        # Creation must also be restrictive when the caller's umask is strict.
+        h.start(preexec=lambda: os.umask(0o777))
+        h.wait_socket()
+        self.assertEqual(h.sock.stat().st_mode & 0o777, 0o600)
+        h.cli('status')
+        h.stop()
         h.sock.write_text('keep me')
         p = h.start()
         self.assertEqual(p.wait(timeout=3), 1)
@@ -546,6 +603,7 @@ if __name__ == '__main__':
                  'test_host_guards_and_stage1_dry_run',
                  'test_init_fake_supervisor_crash_and_adopted_child_timeout']
         suite = unittest.TestSuite(Integration(name) for name in names)
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ConnectionBackpressure))
         sys.exit(0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)
     # Report restricted environments explicitly; do not convert failures in the
     # actual suite into skips. Run this suite on a normal host before release.

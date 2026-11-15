@@ -125,6 +125,11 @@ class ControlSocket {
                 throw std::runtime_error("stale socket changed during cleanup");
         } else if (errno != ENOENT)
             throw std::runtime_error("cannot inspect socket path");
+        // Linux bind() copies the socket inode's mode to the new pathname inode.
+        // Set it before bind: fchmod() afterwards only changes the socket inode,
+        // while pathname chmod would have to resolve a potentially replaced name.
+        if (fchmod(socket_.get(), 0600) < 0)
+            throw std::runtime_error("cannot restrict socket creation mode");
         const mode_t old_mask = umask(0077);
         const int bound =
             bind(socket_.get(), reinterpret_cast<const sockaddr *>(&addr), sizeof(addr));
@@ -133,7 +138,12 @@ class ControlSocket {
             throw std::runtime_error("socket bind failed");
         if (fstatat(parent_.get(), name_.c_str(), &identity_, AT_SYMLINK_NOFOLLOW) < 0)
             throw std::runtime_error("cannot identify bound socket");
-        if (fchmodat(parent_.get(), name_.c_str(), 0600, 0) < 0 || listen(socket_.get(), 16) < 0) {
+        if (!S_ISSOCK(identity_.st_mode) || identity_.st_uid != geteuid() ||
+            (identity_.st_mode & 07777) != 0600) {
+            cleanup();
+            throw std::runtime_error("bound socket must be owned by this user with mode 0600");
+        }
+        if (listen(socket_.get(), 16) < 0) {
             cleanup();
             throw std::runtime_error("socket listen failed");
         }
