@@ -42,4 +42,44 @@ jobs:
       - name: Build
         run: cmake --build build -j2
       - name: Test including named Unix sockets
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --verbose --output-on-failure
+  qemu:
+    name: QEMU boot smoke
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Prepare disposable VM inputs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 busybox-static
+          kernel_package=$(apt-cache depends linux-image-generic | awk '$1 == "Depends:" && $2 ~ /^linux-image-[0-9]/ {print $2; exit}')
+          test -n "$kernel_package"
+          mkdir -p "$RUNNER_TEMP/strazh-kernel"
+          cd "$RUNNER_TEMP/strazh-kernel"
+          # Extract only: never install a kernel or change the runner's boot setup.
+          apt-get download "$kernel_package"
+          set -- ./*.deb
+          test "$#" -eq 1
+          dpkg-deb --extract "$1" root
+          sha256sum "$1"
+          set -- "$RUNNER_TEMP/strazh-kernel/root/boot"/vmlinuz-*
+          test "$#" -eq 1
+          test -f "$1"
+          printf 'STRAZH_QEMU_KERNEL=%s\n' "$1" >> "$GITHUB_ENV"
+          printf 'Kernel package: %s\n' "$kernel_package"
+          dpkg-query -W qemu-system-x86 busybox-static
+      - name: Build static Strazh
+        run: |
+          cmake -S . -B build-qemu -DCMAKE_BUILD_TYPE=Release \
+            -DSTRAZH_WERROR=ON -DCMAKE_EXE_LINKER_FLAGS=-static
+          cmake --build build-qemu -j2
+      - name: Pack initramfs and record inputs
+        run: |
+          python3 tools/make-qemu-rootfs.py build-qemu "$(command -v busybox)" rootfs.cpio.gz
+          sha256sum "$STRAZH_QEMU_KERNEL" "$(command -v busybox)" rootfs.cpio.gz
+      - name: Boot and verify service management and bounded shutdown
+        run: python3 tools/qemu-smoke.py "$STRAZH_QEMU_KERNEL" rootfs.cpio.gz

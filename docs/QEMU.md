@@ -5,6 +5,17 @@ mounting, extracting device nodes, or touching the host's init configuration.
 Device nodes exist only as archive records. The VM gets no disks, network or
 host directory shares. The runner terminates only the QEMU process it launches.
 
+## Automated validation
+
+The `QEMU boot smoke` Actions job runs after every GCC Debug, GCC Release and
+Clang sanitizer job succeeds. It installs QEMU and static BusyBox in the
+throwaway runner, downloads a kernel package and extracts it without installing
+the kernel or changing the runner's boot configuration. Package versions and
+SHA-256 hashes of the kernel package, kernel image, BusyBox and initramfs appear
+in the job log. Strazh is built statically and the existing diskless,
+networkless smoke runner requires both the guest PASS and successful shutdown
+markers. The guest uses TCG; KVM and host mounts are not required.
+
 ## Inputs
 
 Provide an x86-64 Linux `bzImage` and a **statically linked BusyBox**. Pin and
