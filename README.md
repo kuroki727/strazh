@@ -1,145 +1,243 @@
-# strazh
+# Strazh v0.1.0
 
-A minimal, dependency-free PID 1 and service supervisor for Linux, written in C++17.
+Strazh is a small Linux PID 1 and service supervisor in C++17. Services are
+plain directories with executable `run` files. Runtime dependencies are libc,
+libstdc++ and Linux syscalls; no third-party libraries or configuration language
+are required. A shell is needed only for services written as scripts.
 
-## About
+This tree is a **v0.1.0 MVP candidate**, not a claim of production readiness.
+Lifecycle and control components have automated tests. Named-socket integration
+and actual PID 1 boot validation must also pass before a stable release. See
+[the audit](docs/AUDIT.md), [validation results](docs/VALIDATION.md), and
+[VM instructions](docs/QEMU.md).
 
-strazh is a minimal init system for Linux: a PID 1 that mounts what's
-needed to boot, reaps zombies, and hands off to a lightweight service
-supervisor. Services are plain directories with an executable `run`
-file — no config language to parse, no shell required — in the
-spirit of runit and OpenRC, but written from scratch in dependency-
-free C++17.
+## Architecture
 
-strazh is not trying to replace systemd feature-for-feature. It has
-no unit files, no cgroups integration, no socket activation (yet).
-It aims to do one thing — start, supervise, and restart your
-services — reliably and legibly, with a codebase small enough to
-read in an afternoon.
+- `main.cpp` builds `myinit`: blocks CHLD/TERM/INT, consumes signals through
+  signalfd/epoll, reaps children, runs stage1, and starts the supervisor only
+  after stage1 exits successfully. Stage1 has a 30-second boot deadline.
+- `stage1.cpp`: validates mount points, ensures procfs, sysfs, devtmpfs and
+  `/run` tmpfs, and creates private `/run/strazh`. It preserves suitable existing
+  mounts and rejects other mounts. It does not change the hostname.
+- `supervisor.cpp`: discovers services once, validates and sorts dependencies,
+  starts foreground processes in separate sessions, reaps descendants as a Linux
+  subreaper, applies restart backoff, and serves the control socket.
+- `svctl.cpp`: validates commands and exchanges one bounded request/response.
+- `linux_support.h` and `control_socket.h`: descriptor ownership, child setup,
+  signal restoration, process helpers and stream framing shared by components.
 
-## Repository layout
+All exec children receive default signal dispositions and an empty signal mask.
+A CLOEXEC pipe reports setup/exec failures without blocking the supervisor.
+Unexpected supervisor exit is fatal: PID 1 stops adopted children and does not
+restart over potentially surviving services. This avoids duplicate instances and
+supervisor restart loops; automatic supervisor recovery is deferred.
 
-```
-strazh/
-├── main.cpp        # PID 1: signalfd + epoll loop, zombie reaping, spawns stage1
-├── stage1.cpp       # mounts proc/sysfs/tmpfs, sets hostname
-├── CMakeLists.txt
-└── LICENSE
-```
+TERM and INT both request shutdown. Services get a five-second TERM grace,
+then KILL and a one-second reap deadline. PID 1 allows eight seconds for graceful
+shutdown, then one second after KILL. Final exception cleanup can take another
+second. No blocking waitpid is used. Unkillable kernel tasks produce an error;
+these are deadlines for userspace policy, not real-time kernel guarantees.
 
-> **Note:** `CMakeLists.txt` currently points at `src/main.cpp` and
-> `src/stage1.cpp`, but the sources live at the repo root — `cmake
-> --build` will fail until one of these is fixed: either move the
-> `.cpp` files into `src/`, or drop the `src/` prefix in
-> `CMakeLists.txt`.
-
-## Features
-
-- Minimal PID 1 (`main.cpp`): `signalfd` + `epoll` event loop,
-  zombie reaping via `waitpid(WNOHANG)`, tracks `stage1`'s exit
-  status separately from other reaped children
-- Defensive error handling — file descriptors are closed on every
-  error path (`epoll_create1`, `epoll_ctl`, `spawn_stage1` failures)
-  so PID 1 doesn't leak fds while limping along
-- Portable header includes — `__has_include` fallbacks
-  (`<cstdio>`/`<stdio.h>`, `<csignal>`/`<signal.h>`, etc.) for
-  libcs where the C++-wrapped headers aren't available
-- `stage1`: real `mount(2)` for `proc`/`sysfs`/`tmpfs`,
-  `sethostname(2)`, guarded with `#error` on non-Linux
-- Service supervisor — directory-based, no config parser (planned)
-- Dependency ordering between services (planned)
-- Control socket + `svctl`/`initctl` CLIs for start/stop/status/reboot (planned)
-- Zero external dependencies — pure C++17 and Linux syscalls, nothing else
-
-## Status
-
-Early / work in progress, not bootable yet.
-
-- [x] PID 1 skeleton — `signalfd`/`epoll` loop, zombie reaping
-- [x] `stage1` — mounts `proc`, `sysfs`, `tmpfs`; sets hostname
-- [ ] Fix `CMakeLists.txt` source paths (see note above)
-- [ ] Real shutdown — `reboot(2)` with `RB_AUTOBOOT`/`RB_POWER_OFF`
-      (currently `SIGTERM`/`SIGINT` just stop the main loop)
-- [ ] Service supervisor — spawn/respawn from `/etc/sv/<name>/run`
-- [ ] Dependency ordering (`after` file, topological sort)
-- [ ] Control socket + `svctl`
-- [ ] `initctl` — reboot/halt/reexec
-- [ ] Logging subsystem (`svlogd`-style, per-service log pipe)
-- [ ] `devtmpfs` + udev integration (currently `tmpfs` stub for `/dev`)
-
-## Design principles
-
-- **Directories as config.** A service is a directory with an
-  executable `run` file. No unit-file parser to write or maintain.
-- **Zero external dependencies.** Only libc and POSIX/Linux syscalls
-  — no third-party libraries.
-- **Small and legible over feature-complete.** Not a systemd
-  replacement: no cgroups, no socket activation (yet), no unit
-  language. The goal is a codebase readable end-to-end in an
-  afternoon.
+After shutdown or boot failure, **real PID 1 remains alive and reaps children**.
+Physical poweroff/reboot, filesystem unmounting and an emergency console are not
+implemented. In explicit host test mode, `myinit` returns success or failure.
 
 ## Building
 
-Requires a C++17 compiler, CMake ≥ 3.16, and Linux (the code uses
-`signalfd`, `epoll`, and raw `mount(2)`, so it won't build or run
-anywhere else).
+Use Linux with a C++17 compiler and CMake 3.16 or newer. Stage1's safe mount
+inspection needs Linux 5.8 or newer with mount-ID support and matching headers.
+Arch Linux's GCC and Clang are supported. No test tools are needed by default.
 
 ```sh
-git clone https://github.com/kuroki727/strazh
-cd strazh
-cmake -B build
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j2
 ```
 
-This produces `build/myinit` and `build/stage1` — once the
-`src/` path mismatch above is resolved.
-
-## Testing
-
-strazh is meant to run as real PID 1, so it is **not** something you
-run on your host machine to test — a broken build as your actual
-init means an unbootable system. Development and testing happens in
-QEMU against a disposable rootfs:
+Outputs: `myinit`, `stage1`, `supervisor`, and `svctl` in `build/`.
+Debug, strict warnings, tests and sanitizers:
 
 ```sh
-qemu-system-x86_64 \
-  -kernel bzImage \
-  -initrd rootfs.cpio \
-  -append "init=/myinit console=ttyS0"
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON -DSTRAZH_WERROR=ON
+cmake --build build-debug -j2
+ctest --test-dir build-debug --output-on-failure
+
+cmake -S . -B build-sanitize -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DSTRAZH_WERROR=ON \
+  -DSTRAZH_ASAN=ON -DSTRAZH_UBSAN=ON
+cmake --build build-sanitize -j2
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build-sanitize --output-on-failure
 ```
 
-Individual components can be smoke-tested in isolation before that.
-`stage1` accepts an optional root path so its `mount()` calls can be
-pointed at a scratch directory instead of the real `/proc`, `/sys`,
-`/dev`:
+ASan and UBSan can be enabled independently. Tests additionally need Python 3.8+
+(standard library only) and compiler thread support for a socket-pair fixture.
+Warnings include conversion, sign conversion, shadowing, pedantic and format checks.
+LeakSanitizer needs permission to inspect processes with ptrace. In restricted
+sandboxes, `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1` allows ASan/UBSan checks;
+this does not verify leaks. Do not change host kernel settings to run tests.
+
+To stage binaries for a disposable rootfs (no host installation):
 
 ```sh
-mkdir -p /tmp/scratch-root/proc /tmp/scratch-root/sys /tmp/scratch-root/dev
-./stage1 /tmp/scratch-root
-mount | grep scratch-root   # verify
+DESTDIR="$PWD/rootfs-stage" cmake --install build --prefix /
 ```
 
-`main.cpp` (as `myinit`) can similarly be run as a regular process
-and sent signals directly (`kill -TERM <pid>`) to check the
-`signalfd`/`epoll` loop and reap logic without needing to be PID 1.
+This places the three system executables under `/etc/myinit` and `svctl` under
+`/bin` inside the staging directory. It does not create service definitions.
 
-## Service directory format (planned)
+## Services
 
-Modeled on runit — a service is a directory, not a config file to parse:
+Default layout:
 
-```
-/etc/sv/<name>/
-  run       # executable, exec'd directly — no shell wrapper required
-  finish    # optional, run once the service stops
-  after     # optional, newline-separated list of services to start first
+```text
+/etc/sv/example/
+  run       executable regular file, or symlink to one
+  after     optional regular text file, at most 64 KiB
 ```
 
-## License
+Names are 1–128 ASCII letters, digits, dots, underscores or hyphens and may not
+start with a dot. Entries without an executable regular `run` are ignored.
+Discovery errors fail startup; an empty service directory is valid. The maximum
+is 4096 services. Directory and run-file symlinks are permitted for trusted
+configuration. Services execute with their service directory as working directory.
 
-MIT. See [LICENSE](LICENSE).
+Example `run`:
 
-## Contributing
+```sh
+#!/bin/sh
+exec /usr/bin/example-daemon --foreground
+```
 
-Not yet accepting external contributions — still a solo learning
-project in its early stages. Issues and discussion are welcome once
-there's a first tagged release.
+`run` is executed directly, with no implicit shell. Script files require a valid
+interpreter line. Keep the leader in the foreground. Double-forking, changing
+sessions/process groups, and intentionally escaping supervision are unsupported.
+There is no `finish` hook, oneshot service type, user switching or reload command.
+
+`after` contains one service name per line; blank lines and lines starting with
+`#` are ignored, surrounding whitespace is trimmed, and duplicates are removed.
+Missing dependencies, self references and cycles reject the entire configuration
+before any services start. Independent services use deterministic name order.
+
+Dependencies gate each new start until their leaders have successfully exec'd
+and are running. Failed, stopped or stopping dependencies keep a service
+`blocked`. **Exec success is not application readiness.** A later dependency loss
+does not stop already running dependents. Stop/start commands do not recursively
+change dependency state; start prerequisites explicitly when needed.
+
+Every unrequested leader exit, including exit code zero, restarts with delays of
+500 ms, 1 s, 2 s, 4 s, up to 30 s. A run lasting at least 30 s resets the next
+delay to 500 ms. Fork/pipe failures also back off. A process-group slot is retained
+until its leader is reaped and the old group disappears. Remaining group members
+are killed when the foreground leader exits.
+
+## Control interface
+
+```sh
+svctl status
+svctl stop example
+svctl start example
+svctl restart example
+STRAZH_SOCKET=/absolute/private/control.sock svctl status
+```
+
+`status` reports `starting`, `running`, `stopping`, `disabled`, `blocked`, or
+`stopped`, with PID where applicable, backoff and next-start delay.
+
+Commands acknowledge the desired state with `OK`; they do not wait for convergence.
+Check status to confirm completion. `start` is idempotent and does not clear an
+already enabled service's crash delay. `stop` disables automatic restart.
+`restart` explicitly resets the delay and waits for old-process cleanup before
+spawning. Repeated commands do not extend the stop deadline. Unknown services,
+invalid syntax and mutations during shutdown return `ERR`.
+
+Exit codes: **0** successful response, **1** server/transport/protocol failure,
+**2** invalid CLI usage.
+
+The default socket is `/run/strazh/supervisor.sock`. Both programs honor
+`STRAZH_SOCKET`; an explicit supervisor socket argument takes precedence:
+
+```text
+supervisor [SERVICES_DIR [SOCKET_PATH]]
+myinit [STAGE1 [SUPERVISOR [SERVICES_DIR]]]        # PID 1 only
+myinit --test FAKE_STAGE1 SUPERVISOR SERVICES_DIR # ordinary process only
+```
+
+The socket requires an absolute path with no symlink parents. Its parent must
+already exist, be owned by the supervisor user, and have no group/other write
+permission. Use a private directory such as one created with `mktemp -d`.
+Socket mode is 0600. Persistent 0600 lock files prevent competing socket owners;
+an additional directory lock prevents two supervisors for the same service tree.
+Do not delete live lock files. Only same-owner, demonstrably stale sockets are
+removed; regular files, symlinks, live sockets and foreign sockets are preserved.
+Cleanup checks the bound inode before removing it.
+
+Wire protocol: one newline-terminated request per connection, at most 512 bytes
+including newline. Response begins `OK\n` or `ERR message\n`; EOF terminates the
+response. No pipelining. The server supports at most 64 concurrent clients and a
+two-second total client lifetime. CLI socket I/O has a three-second total deadline and a
+1 MiB response limit. All socket I/O is nonblocking and supports partial transfers.
+
+## Development and testing
+
+CTest provides core lifecycle tests, socket-pair control tests, host safety tests,
+and a separate full integration suite using named Unix sockets. All fixtures use
+temporary directories and their own disposable child processes. Tests never
+mount, change hostname, broadcast signals, reboot or run init as host PID 1.
+
+Restricted sandboxes may deny Unix socket binding. The named-socket suite then
+reports **Skipped**, not validated. Require it for a release gate on an
+unrestricted Linux environment:
+
+```sh
+STRAZH_REQUIRE_INTEGRATION=1 ctest --test-dir build-debug --output-on-failure
+```
+
+The checked-in CI workflow requires named-socket integration, with GCC Debug,
+GCC Release, and Clang ASan/UBSan jobs. It has not been run remotely as part of
+this local task; no changes have been pushed.
+
+The full integration suite covers real discovery/startup, command races, crash
+backoff, failed exec, dependency blocking, TERM-ignoring services, process churn,
+malformed/fragmented control traffic, stale/live/unsafe socket paths, CLI errors,
+supervisor failure and shutdown under continuous client traffic.
+
+For mount-point validation without any mount or hostname syscall:
+
+```sh
+build/stage1 --dry-run /path/to/disposable/root
+```
+
+The root must contain real directories `proc`, `sys`, `dev`, and `run`. Actual
+stage1 execution requires `--boot`, root privileges and a PID 1 parent. `myinit`
+passes this flag during real boot; its host test mode must use a fake stage1 such
+as `/bin/true`. Never install experimental init as the host's PID 1. Use the
+[QEMU fixture](docs/QEMU.md) for actual boot and mount validation.
+
+## Security and limitations
+
+Service configuration is executable privileged code. Its directory tree,
+symlink targets, binaries and interpreters must be controlled by the administrator.
+Do not allow untrusted users to modify them. The control socket checks peer
+credentials (same effective UID or root) in addition to filesystem permissions.
+Socket directories and their ancestors must be administered safely; same-UID or
+root adversaries can modify service configuration and are outside this boundary.
+
+Process groups and subreaping provide lifecycle management, not a security
+sandbox. There are no cgroups, privilege isolation, resource limits, readiness
+protocol, service-specific environment configuration, managed logging, hot reload,
+udev integration or PTY setup. Parent-death signals protect ordinary foreground
+leaders, but Linux clears this setting on some credential changes; it is not
+complete descendant containment. A standalone supervisor forcibly killed with
+SIGKILL cannot run cleanup; PID 1 performs adoption cleanup in the intended
+architecture. Uninterruptible kernel tasks may outlive a shutdown deadline.
+
+## Roadmap
+
+Before tagging v0.1.0: complete unrestricted integration and VM boot validation,
+review this change set, and record the exact toolchain/kernel/BusyBox inputs.
+Next releases: filesystem teardown and poweroff/reboot, an emergency recovery
+console, stronger service-tree containment, readiness and oneshot semantics,
+logging, configuration reload, and measured supervisor recovery.
+
+MIT license. See [LICENSE](LICENSE).

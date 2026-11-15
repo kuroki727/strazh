@@ -1,230 +1,193 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#if __has_include(<cstdio>)
-#include <cstdio>
-#else
-#include <stdio.h>
-#endif
-#if __has_include(<cstdlib>)
-#include <cstdlib>
-#else
-#include <stdlib.h>
-#endif
-#if __has_include(<cerrno>)
-#include <cerrno>
-#else
-#include <errno.h>
-#endif
-#if __has_include(<csignal>)
-#include <csignal>
-#else
-#include <signal.h>
-#endif
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/epoll.h>
-#include <fcntl.h>
-#include <time.h>
-#include <algorithm>
-#include <climits>
-#if __has_include(<sys/signalfd.h>)
-#include <sys/signalfd.h>
-#elif __has_include(<linux/signalfd.h>)
-#include <linux/signalfd.h>
-#else
-#error "This program requires Linux signalfd support"
-#endif
+#include "linux_support.h"
+#include <cstring>
+#include <exception>
 
 namespace {
+using namespace strazh;
+constexpr long long kBootTimeoutMs = 30000;
+constexpr long long kShutdownGraceMs = 8000;
+constexpr long long kKillGraceMs = 1000;
 
-constexpr long long kMinRuntimeMs = 1000;    // меньше — считаем "упал быстро"
-constexpr long long kInitialBackoffMs = 500;
-constexpr long long kMaxBackoffMs = 30000;
-
-long long now_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
-}
-
-int setup_signalfd() {
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGINT);
-
-    if (sigprocmask(SIG_BLOCK, &mask, nullptr) == -1) {
-        std::perror("sigprocmask");
-        return -1;
-    }
-
-    int sfd = signalfd(-1, &mask, SFD_CLOEXEC);
-    if (sfd == -1) {
-        std::perror("signalfd");
-    }
-    return sfd;
-}
-
-pid_t spawn_child(const char *path, const char *arg1, const char *label) {
-    pid_t pid = fork();
-    if (pid == -1) {
-        std::perror("fork");
-        return -1;
-    }
-    if (pid == 0) {
-        if (arg1) {
-            execl(path, path, arg1, static_cast<char *>(nullptr));
-        } else {
-            execl(path, path, static_cast<char *>(nullptr));
+int finish(int result) {
+    if (getpid() != 1)
+        return result;
+    // Exiting PID 1 panics the kernel. Until filesystem teardown and poweroff
+    // are implemented, remain quiescent and keep reaping, including on failure.
+    std::fprintf(stderr, "[myinit] %s; PID 1 remains in reap-only mode\n",
+                 result ? "boot/runtime failure" : "shutdown complete");
+    for (;;) {
+        while (waitpid(-1, nullptr, WNOHANG) > 0) {
         }
-        std::perror("execl");
-        _exit(127);
+        timespec delay{1, 0};
+        nanosleep(&delay, nullptr);
     }
-    std::fprintf(stderr, "[myinit] spawned %s (%s) as pid %d\n", label, path, pid);
-    return pid;
 }
 
-} // namespace
-
-int main(int argc, char *argv[]) {
-    std::fprintf(stderr, "[myinit] starting as pid %d\n", getpid());
-
-    const char *stage1_path     = (argc > 1) ? argv[1] : "/etc/myinit/stage1";
-    const char *supervisor_path = (argc > 2) ? argv[2] : "/etc/myinit/supervisor";
-    const char *services_dir    = (argc > 3) ? argv[3] : "/etc/sv";
-
-    int sfd = setup_signalfd();
-    if (sfd == -1) return 1;
-
-    int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd == -1) {
-        std::perror("epoll_create1");
-        close(sfd);
+int run(int argc, char **argv) {
+    const bool test = argc > 1 && std::strcmp(argv[1], "--test") == 0;
+    if ((getpid() != 1 && !test) || (test && (getpid() == 1 || argc != 5)) || (!test && argc > 4)) {
+        std::fprintf(stderr, "usage: myinit [STAGE1 [SUPERVISOR [SERVICES]]] (PID 1 only)\n"
+                             "       myinit --test FAKE_STAGE1 SUPERVISOR SERVICES\n");
+        return 2;
+    }
+    const int offset = test ? 1 : 0;
+    const char *stage1 = argc > 1 + offset ? argv[1 + offset] : "/etc/myinit/stage1";
+    const char *supervisor = argc > 2 + offset ? argv[2 + offset] : "/etc/myinit/supervisor";
+    const char *services = argc > 3 + offset ? argv[3 + offset] : "/etc/sv";
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) {
+        std::perror("subreaper");
         return 1;
     }
-
-    epoll_event ev{};
-    ev.events = EPOLLIN;
-    ev.data.fd = sfd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev) == -1) {
-        std::perror("epoll_ctl");
-        close(epfd);
-        close(sfd);
+    ChildReaper cleanup;
+    Fd sfd(setup_signalfd());
+    Fd epfd(epoll_create1(EPOLL_CLOEXEC));
+    if (sfd.get() < 0 || epfd.get() < 0 || !epoll_add(epfd.get(), sfd.get())) {
+        std::perror("init event setup");
         return 1;
     }
-
-    pid_t stage1_pid = spawn_child(stage1_path, nullptr, "stage1");
-    if (stage1_pid == -1) {
-        close(epfd);
-        close(sfd);
+    Child early = spawn(stage1, test ? nullptr : "--boot");
+    if (early.pid < 0) {
+        std::perror("spawn stage1");
         return 1;
     }
+    Child manager;
+    bool booted = false, stopping = false, killed = false;
+    int result = 0;
+    const long long boot_deadline = now_ms() + kBootTimeoutMs;
+    long long shutdown_deadline = 0;
+    std::set<pid_t> term_sent;
+    auto shutdown = [&] {
+        if (stopping)
+            return;
+        stopping = true;
+        shutdown_deadline = now_ms() + kShutdownGraceMs;
+        signal_child_group(early.pid, SIGTERM);
+        signal_pid(manager.pid, SIGTERM);
+        if (early.pid > 0)
+            term_sent.insert(early.pid);
+        if (manager.pid > 0)
+            term_sent.insert(manager.pid);
+        std::fprintf(stderr, "[myinit] bounded shutdown started\n");
+    };
 
-    bool stage1_completed = false;
-    pid_t supervisor_pid = -1;          // -1 = сейчас не запущен
-    long long supervisor_start_ms = 0;
-    long long supervisor_next_start_ms = 0; // когда пробовать (пере)запустить
-    long long supervisor_backoff_ms = 0;
-    bool shutting_down = false;
-
-    bool running = true;
-    while (running) {
-        // --- сколько ждать в epoll_wait ---
-        int epoll_timeout = -1;
-        if (!shutting_down && stage1_completed && supervisor_pid <= 0) {
-            long long wait_left = std::max<long long>(0, supervisor_next_start_ms - now_ms());
-            epoll_timeout = static_cast<int>(std::min<long long>(wait_left, INT_MAX));
-        }
-
-        epoll_event events[8];
-        int n = epoll_wait(epfd, events, 8, epoll_timeout);
-        if (n == -1) {
-            if (errno == EINTR) continue;
+    for (;;) {
+        epoll_event events[4];
+        const int n = epoll_wait(epfd.get(), events, 4, 50);
+        if (n < 0 && errno != EINTR) {
             std::perror("epoll_wait");
-            break;
+            result = 1;
+            shutdown();
         }
-
-        for (int i = 0; i < n; ++i) {
-            signalfd_siginfo si{};
-            ssize_t r = read(sfd, &si, sizeof(si));
-            if (r != static_cast<ssize_t>(sizeof(si))) continue;
-
-            if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT) {
-                if (!shutting_down) {
-                    shutting_down = true;
-                    std::fprintf(stderr, "[myinit] got signal %d, shutting down\n", si.ssi_signo);
-                    if (supervisor_pid > 0) {
-                        std::fprintf(stderr, "[myinit] forwarding shutdown to supervisor\n");
-                        kill(supervisor_pid, SIGTERM);
-                    } else if (!stage1_completed) {
-                        std::fprintf(stderr, "[myinit] shutdown requested before supervisor started, stopping stage1\n");
-                        kill(stage1_pid, SIGTERM);
-                    }
-                }
+        signalfd_siginfo info{};
+        for (int count = 0; count < 64; ++count) {
+            const ssize_t r = read(sfd.get(), &info, sizeof(info));
+            if (r < 0 && errno == EINTR) {
+                --count;
                 continue;
             }
-
-            if (si.ssi_signo != SIGCHLD) continue;
-
-            for (;;) {
-                int status = 0;
-                pid_t pid = waitpid(-1, &status, WNOHANG);
-                if (pid <= 0) break;
-
-                if (pid == stage1_pid) {
-                    stage1_completed = true;
-                    if (WIFEXITED(status)) {
-                        std::fprintf(stderr, "[myinit] stage1 exited with code %d\n", WEXITSTATUS(status));
-                    } else if (WIFSIGNALED(status)) {
-                        std::fprintf(stderr, "[myinit] stage1 killed by signal %d\n", WTERMSIG(status));
+            if (r < 0 && errno == EAGAIN)
+                break;
+            if (r != static_cast<ssize_t>(sizeof(info))) {
+                result = 1;
+                shutdown();
+                break;
+            }
+            if (info.ssi_signo == SIGTERM || info.ssi_signo == SIGINT)
+                shutdown();
+        }
+        if (early.exec_error.get() >= 0)
+            exec_result(early.exec_error);
+        if (manager.exec_error.get() >= 0)
+            exec_result(manager.exec_error);
+        bool no_children = false;
+        for (;;) {
+            int status = 0;
+            const pid_t pid = waitpid(-1, &status, WNOHANG);
+            if (pid < 0 && errno == EINTR)
+                continue;
+            if (pid < 0 && errno == ECHILD)
+                no_children = true;
+            else if (pid < 0) {
+                std::perror("waitpid");
+                result = 1;
+                shutdown();
+            }
+            if (pid <= 0)
+                break;
+            if (pid == early.pid) {
+                early.pid = -1;
+                if (!stopping) {
+                    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                        std::fprintf(stderr, "[myinit] stage1 failed, status=%d\n", status);
+                        result = 1;
+                        shutdown();
+                    } else {
+                        booted = true;
                     }
-                    supervisor_next_start_ms = now_ms(); // запустить супервизор при первой возможности
-                } else if (pid == supervisor_pid) {
-                    long long ran_ms = now_ms() - supervisor_start_ms;
-                    if (WIFEXITED(status)) {
-                        std::fprintf(stderr, "[myinit] supervisor exited with code %d after %lld ms\n",
-                            WEXITSTATUS(status), ran_ms);
-                    } else if (WIFSIGNALED(status)) {
-                        std::fprintf(stderr, "[myinit] supervisor killed by signal %d after %lld ms\n",
-                            WTERMSIG(status), ran_ms);
-                    }
-                    supervisor_pid = -1;
-                    if (!shutting_down) {
-                        if (ran_ms < kMinRuntimeMs) {
-                            supervisor_backoff_ms = (supervisor_backoff_ms == 0)
-                                ? kInitialBackoffMs
-                                : std::min(supervisor_backoff_ms * 2, kMaxBackoffMs);
-                            std::fprintf(stderr, "[myinit] supervisor died fast, backing off %lld ms before restart\n",
-                                supervisor_backoff_ms);
-                        } else {
-                            supervisor_backoff_ms = 0;
-                        }
-                        supervisor_next_start_ms = now_ms() + supervisor_backoff_ms;
-                    }
-                } else {
-                    std::fprintf(stderr, "[myinit] reaped pid %d (not tracked, likely an orphan)\n", pid);
+                }
+            } else if (pid == manager.pid) {
+                manager.pid = -1;
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                    result = 1;
+                if (!stopping) {
+                    // Fail closed: restarting could duplicate escaped old services.
+                    std::fprintf(stderr, "[myinit] unexpected supervisor exit, status=%d\n",
+                                 status);
+                    result = 1;
+                    shutdown();
                 }
             }
         }
-
-        if (shutting_down && stage1_completed && supervisor_pid <= 0) {
-            running = false;
-            continue;
+        if (!stopping && !booted && now_ms() >= boot_deadline) {
+            std::fprintf(stderr, "[myinit] stage1 boot timeout\n");
+            result = 1;
+            shutdown();
         }
-
-        if (!shutting_down && stage1_completed && supervisor_pid <= 0 &&
-            now_ms() >= supervisor_next_start_ms) {
-            supervisor_pid = spawn_child(supervisor_path, services_dir, "supervisor");
-            supervisor_start_ms = now_ms();
+        if (!stopping && booted && manager.pid < 0) {
+            manager = spawn(supervisor, services);
+            if (manager.pid < 0) {
+                std::perror("spawn supervisor");
+                result = 1;
+                shutdown();
+            }
+        }
+        if (stopping) {
+            // Once supervision has stopped, take responsibility for adopted
+            // descendants. Never broadcast to unrelated host processes.
+            if (manager.pid < 0) {
+                try {
+                    if (killed)
+                        signal_children(SIGKILL);
+                    else
+                        signal_new_children(SIGTERM, term_sent);
+                } catch (const std::exception &e) {
+                    std::fprintf(stderr, "[myinit] %s\n", e.what());
+                }
+            }
+            if (no_children)
+                return result;
+            if (now_ms() >= shutdown_deadline) {
+                if (killed) {
+                    std::fprintf(stderr, "[myinit] children remain after SIGKILL deadline\n");
+                    return 1;
+                }
+                killed = true;
+                signal_pid(early.pid, SIGKILL);
+                signal_group(early.pid, SIGKILL);
+                signal_pid(manager.pid, SIGKILL);
+                shutdown_deadline = now_ms() + kKillGraceMs;
+            }
         }
     }
+}
+} // namespace
 
-    std::fprintf(stderr, "[myinit] all children stopped, exiting main loop\n");
-    close(epfd);
-    close(sfd);
-    return 0;
+int main(int argc, char **argv) {
+    int result = 1;
+    try {
+        result = run(argc, argv);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[myinit] fatal: %s\n", e.what());
+    }
+    return finish(result);
 }
