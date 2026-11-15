@@ -194,8 +194,9 @@ STRAZH_REQUIRE_INTEGRATION=1 ctest --test-dir build-debug --output-on-failure
 ```
 
 The checked-in CI workflow requires named-socket integration, with GCC Debug,
-GCC Release, and Clang ASan/UBSan jobs. It has not been run remotely as part of
-this local task; no changes have been pushed.
+GCC Release, and Clang ASan/UBSan jobs, followed by a diskless QEMU boot smoke
+job. Passing unrestricted CI, leak detection and VM results are recorded in
+[the validation report](docs/VALIDATION.md).
 
 The full integration suite covers real discovery/startup, command races, crash
 backoff, failed exec, dependency blocking, TERM-ignoring services, process churn,
