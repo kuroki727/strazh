@@ -1,0 +1,140 @@
+name: build-and-test
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  source:
+    name: Source checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Formatting, whitespace and script syntax
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format-18
+          git ls-files -z '*.cpp' '*.h' | xargs -0 clang-format-18 -i
+          git diff --no-color --exit-code
+          git diff --check HEAD^ HEAD
+          python3 -m py_compile tests/integration.py tools/make-qemu-rootfs.py tools/qemu-smoke.py
+          bash -n tools/publish-v0.1.0.sh
+          python3 tests/release_gate.py
+  release_permissions:
+    name: Release permission preflight
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Verify contents write without changing any reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # An unreachable empty blob proves Contents: write; no branch/tag/release changes.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" \
+            -f content= -f encoding=utf-8 --jq .sha \
+            | grep -qx e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+          gh api "repos/$GITHUB_REPOSITORY/pulls/1" \
+            --jq '.base.ref == "main" and .head.ref == "release/v0.1.0"' | grep -qx true
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC Debug
+            compiler: g++
+            build_type: Debug
+            sanitizers: 'OFF'
+          - name: GCC Release
+            compiler: g++
+            build_type: Release
+            sanitizers: 'OFF'
+          - name: Clang ASan UBSan
+            compiler: clang++
+            build_type: Debug
+            sanitizers: 'ON'
+    name: ${{ matrix.name }}
+    env:
+      STRAZH_REQUIRE_INTEGRATION: '1'
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTING=ON -DSTRAZH_WERROR=ON
+          -DSTRAZH_ASAN=${{ matrix.sanitizers }}
+          -DSTRAZH_UBSAN=${{ matrix.sanitizers }}
+      - name: Build
+        run: cmake --build build -j2
+      - name: Test including named Unix sockets
+        run: ctest --test-dir build --verbose --output-on-failure
+  qemu:
+    name: QEMU boot smoke
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Prepare disposable VM inputs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 busybox-static
+          kernel_package=$(apt-cache depends linux-image-generic | awk '$1 == "Depends:" && $2 ~ /^linux-image-[0-9]/ {print $2; exit}')
+          test -n "$kernel_package"
+          mkdir -p "$RUNNER_TEMP/strazh-kernel"
+          cd "$RUNNER_TEMP/strazh-kernel"
+          # Extract only: never install a kernel or change the runner's boot setup.
+          apt-get download "$kernel_package"
+          set -- ./*.deb
+          test "$#" -eq 1
+          dpkg-deb --extract "$1" root
+          sha256sum "$1"
+          set -- "$RUNNER_TEMP/strazh-kernel/root/boot"/vmlinuz-*
+          test "$#" -eq 1
+          test -f "$1"
+          printf 'STRAZH_QEMU_KERNEL=%s\n' "$1" >> "$GITHUB_ENV"
+          printf 'Kernel package: %s\n' "$kernel_package"
+          dpkg-query -W qemu-system-x86 busybox-static
+      - name: Build static Strazh
+        run: |
+          cmake -S . -B build-qemu -DCMAKE_BUILD_TYPE=Release \
+            -DSTRAZH_WERROR=ON -DCMAKE_EXE_LINKER_FLAGS=-static
+          cmake --build build-qemu -j2
+      - name: Pack initramfs and record inputs
+        run: |
+          python3 tools/make-qemu-rootfs.py build-qemu "$(command -v busybox)" rootfs.cpio.gz
+          sha256sum "$STRAZH_QEMU_KERNEL" "$(command -v busybox)" rootfs.cpio.gz
+      - name: Boot and verify service management and bounded shutdown
+        run: python3 tools/qemu-smoke.py "$STRAZH_QEMU_KERNEL" rootfs.cpio.gz
+  publish:
+    name: Publish Strazh v0.1.0
+    needs: [source, release_permissions, test, qemu]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Annotate the verified merge and publish source-only release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/publish-v0.1.0.sh

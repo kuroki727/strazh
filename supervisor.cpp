@@ -1,70 +1,69 @@
-#if __has_include(<cstdio>)
-#include <cstdio>
-#else
-#include <stdio.h>
-#endif
-#include <unistd.h>
+#include "control_socket.h"
 #include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/epoll.h>
-#include <sys/signalfd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <signal.h>
-#include <time.h>
-#include <cerrno>
-#include <cstring>
-#include <string>
-#include <vector>
-#include <map>
 #include <deque>
-#include <fstream>
+#include <map>
+#include <memory>
+#include <cstdlib>
 #include <sstream>
-#include <algorithm>
-#include <climits>
 
 namespace {
+using namespace strazh;
 
-constexpr long long kMinRuntimeMs = 1000;
-constexpr long long kInitialBackoffMs = 500;
-constexpr long long kMaxBackoffMs = 30000;
 constexpr long long kShutdownGraceMs = 5000;
-constexpr long long kDependencyPollMs = 200;
+constexpr long long kKillGraceMs = 1000;
 
 struct ServiceState {
     std::string name;
     std::string run_path;
     std::vector<std::string> after;
-    pid_t pid = 0;
+    pid_t pid = 0; // process group ID; retained until leader reaped AND group gone
+    Fd exec_error;
     long long start_time_ms = 0;
     long long next_start_ms = 0;
     long long backoff_ms = 0;
-    bool disabled = false; // выключен вручную через control socket ('stop')
-    bool manual_action = false; // следующий SIGCHLD — от нашего же kill(), не краш
+    long long stop_deadline_ms = 0;
+    bool disabled = false;
+    bool manual_action = false;
+    bool stopping = false;
+    bool reaped = false;
+    bool exec_ok = false;
 };
-
-long long now_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
-}
 
 std::vector<std::string> read_after_file(const std::string &path) {
     std::vector<std::string> deps;
+    struct stat st {};
+    if (stat(path.c_str(), &st) < 0) {
+        if (errno == ENOENT)
+            return deps;
+        throw std::runtime_error("cannot inspect " + path);
+    }
+    if (!S_ISREG(st.st_mode) || st.st_size > 65536)
+        throw std::runtime_error("after must be a regular file of at most 64 KiB");
     std::ifstream f(path);
-    if (!f) return deps;
+    if (!f) {
+        if (std::filesystem::exists(path))
+            throw std::runtime_error("cannot read " + path);
+        return deps;
+    }
+    if (std::filesystem::file_size(path) > 65536)
+        throw std::runtime_error("after file too large");
 
     std::string line;
     while (std::getline(f, line)) {
         size_t start = line.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) continue;
+        if (start == std::string::npos)
+            continue;
         size_t end = line.find_last_not_of(" \t\r\n");
         line = line.substr(start, end - start + 1);
-        if (line.empty() || line[0] == '#') continue;
-        deps.push_back(line);
+        if (line.empty() || line[0] == '#')
+            continue;
+        if (!valid_name(line))
+            throw std::runtime_error("invalid dependency in " + path);
+        if (std::find(deps.begin(), deps.end(), line) == deps.end())
+            deps.push_back(line);
     }
+    if (f.bad())
+        throw std::runtime_error("error reading " + path);
     return deps;
 }
 
@@ -73,18 +72,28 @@ std::vector<ServiceState> discover_services(const std::string &services_dir) {
 
     DIR *dir = opendir(services_dir.c_str());
     if (dir == nullptr) {
-        std::fprintf(stderr, "[supervisor] opendir %s failed: %s\n",
-            services_dir.c_str(), std::strerror(errno));
-        return services;
+        std::fprintf(stderr, "[supervisor] opendir %s failed: %s\n", services_dir.c_str(),
+                     std::strerror(errno));
+        throw std::runtime_error("service discovery failed");
     }
+    const auto close_directory = [](DIR *d) { closedir(d); };
+    std::unique_ptr<DIR, decltype(close_directory)> directory(dir, close_directory);
 
     dirent *entry;
-    while ((entry = readdir(dir)) != nullptr) {
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno)
+                throw std::runtime_error("readdir failed");
+            break;
+        }
         std::string name = entry->d_name;
-        if (name == "." || name == "..") continue;
+        if (!valid_name(name))
+            continue;
 
         std::string run_path = services_dir + "/" + name + "/run";
-        struct stat st{};
+        struct stat st {};
         if (stat(run_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
             continue;
         }
@@ -97,8 +106,11 @@ std::vector<ServiceState> discover_services(const std::string &services_dir) {
         svc.run_path = run_path;
         svc.after = read_after_file(services_dir + "/" + name + "/after");
         services.push_back(std::move(svc));
+        if (services.size() > 4096)
+            throw std::runtime_error("too many services (maximum 4096)");
     }
-    closedir(dir);
+    std::sort(services.begin(), services.end(),
+              [](const auto &a, const auto &b) { return a.name < b.name; });
     return services;
 }
 
@@ -108,22 +120,11 @@ std::vector<ServiceState> resolve_order(std::vector<ServiceState> services) {
         name_to_index[services[i].name] = i;
     }
 
-    for (auto &svc : services) {
-        std::vector<std::string> valid;
+    for (const auto &svc : services) {
         for (const auto &dep : svc.after) {
-            if (dep == svc.name) {
-                std::fprintf(stderr, "[supervisor] service %s: 'after' lists itself, ignoring\n",
-                    svc.name.c_str());
-                continue;
-            }
-            if (name_to_index.find(dep) == name_to_index.end()) {
-                std::fprintf(stderr, "[supervisor] service %s: unknown dependency '%s', ignoring\n",
-                    svc.name.c_str(), dep.c_str());
-                continue;
-            }
-            valid.push_back(dep);
+            if (name_to_index.find(dep) == name_to_index.end())
+                throw std::runtime_error(svc.name + ": missing dependency " + dep);
         }
-        svc.after = std::move(valid);
     }
 
     std::vector<std::vector<size_t>> dependents(services.size());
@@ -137,7 +138,8 @@ std::vector<ServiceState> resolve_order(std::vector<ServiceState> services) {
 
     std::deque<size_t> queue;
     for (size_t i = 0; i < services.size(); ++i) {
-        if (indegree[i] == 0) queue.push_back(i);
+        if (indegree[i] == 0)
+            queue.push_back(i);
     }
 
     std::vector<size_t> order;
@@ -149,411 +151,390 @@ std::vector<ServiceState> resolve_order(std::vector<ServiceState> services) {
         order.push_back(i);
         placed[i] = true;
         for (size_t d : dependents[i]) {
-            if (--indegree[d] == 0) queue.push_back(d);
+            if (--indegree[d] == 0)
+                queue.push_back(d);
         }
     }
 
     if (order.size() < services.size()) {
-        std::string cycle_names;
-        for (size_t i = 0; i < services.size(); ++i) {
-            if (!placed[i]) {
-                if (!cycle_names.empty()) cycle_names += ", ";
-                cycle_names += services[i].name;
-                services[i].after.clear();
-            }
-        }
-        std::fprintf(stderr,
-            "[supervisor] dependency cycle detected involving: %s — starting them without ordering\n",
-            cycle_names.c_str());
-        for (size_t i = 0; i < services.size(); ++i) {
-            if (!placed[i]) order.push_back(i);
-        }
+        std::string names;
+        for (size_t i = 0; i < services.size(); ++i)
+            if (!placed[i])
+                names += " " + services[i].name;
+        throw std::runtime_error("dependency cycle (or dependent on cycle):" + names);
     }
 
     std::vector<ServiceState> sorted;
     sorted.reserve(services.size());
-    for (size_t i : order) sorted.push_back(std::move(services[i]));
+    for (size_t i : order)
+        sorted.push_back(std::move(services[i]));
     return sorted;
 }
 
 bool dependencies_ready(const ServiceState &svc, const std::vector<ServiceState> &services,
-                         const std::map<std::string, size_t> &name_to_index) {
+                        const std::map<std::string, size_t> &name_to_index) {
     for (const auto &dep : svc.after) {
         auto it = name_to_index.find(dep);
-        if (it == name_to_index.end()) continue;
-        if (services[it->second].pid == 0) return false;
+        if (it == name_to_index.end())
+            return false;
+        const auto &dependency = services[it->second];
+        if (!dependency.pid || !dependency.exec_ok || dependency.reaped || dependency.stopping ||
+            dependency.disabled)
+            return false;
     }
     return true;
 }
 
 bool spawn_service(ServiceState &svc) {
-    pid_t pid = fork();
-    if (pid == -1) {
-        std::fprintf(stderr, "[supervisor] fork for %s failed: %s\n",
-            svc.name.c_str(), std::strerror(errno));
+    const std::string cwd = std::filesystem::path(svc.run_path).parent_path().string();
+    Child child = spawn(svc.run_path.c_str(), nullptr, cwd.c_str());
+    if (child.pid < 0) {
+        std::perror("spawn service");
+        svc.backoff_ms = next_backoff(svc.backoff_ms, 0);
+        svc.next_start_ms = now_ms() + svc.backoff_ms;
         return false;
     }
-    if (pid == 0) {
-        execl(svc.run_path.c_str(), svc.run_path.c_str(), static_cast<char *>(nullptr));
-        std::fprintf(stderr, "[supervisor] execl %s failed: %s\n",
-            svc.run_path.c_str(), std::strerror(errno));
-        _exit(127);
-    }
-    svc.pid = pid;
+    svc.pid = child.pid;
+    svc.exec_error = std::move(child.exec_error);
     svc.start_time_ms = now_ms();
-    std::fprintf(stderr, "[supervisor] started %s as pid %d\n", svc.name.c_str(), pid);
+    svc.reaped = svc.stopping = svc.exec_ok = false;
+    std::fprintf(stderr, "[supervisor] started %s pid=%d\n", svc.name.c_str(), svc.pid);
     return true;
 }
 
-int setup_signalfd() {
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    sigaddset(&mask, SIGTERM);
-
-    if (sigprocmask(SIG_BLOCK, &mask, nullptr) == -1) {
-        std::perror("sigprocmask");
-        return -1;
-    }
-    int sfd = signalfd(-1, &mask, SFD_CLOEXEC);
-    if (sfd == -1) {
-        std::perror("signalfd");
-    }
-    return sfd;
+void request_stop(ServiceState &svc) {
+    if (!svc.pid || svc.stopping || svc.reaped)
+        return;
+    svc.stopping = true;
+    svc.stop_deadline_ms = now_ms() + kShutdownGraceMs;
+    signal_child_group(svc.pid, SIGTERM);
 }
 
-// --- control socket ---
-
-int create_control_socket(const std::string &path) {
-    if (path.size() >= sizeof(sockaddr_un{}.sun_path)) {
-        std::fprintf(stderr, "[supervisor] control socket path too long: %s\n", path.c_str());
-        return -1;
-    }
-
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd == -1) {
-        std::perror("socket");
-        return -1;
-    }
-
-    unlink(path.c_str()); // подчищаем сокет от предыдущего (упавшего) запуска
-
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == -1) {
-        std::fprintf(stderr, "[supervisor] bind %s failed: %s\n", path.c_str(), std::strerror(errno));
-        close(fd);
-        return -1;
-    }
-    if (listen(fd, 16) == -1) {
-        std::perror("listen");
-        close(fd);
-        return -1;
-    }
-    std::fprintf(stderr, "[supervisor] control socket listening at %s\n", path.c_str());
-    return fd;
-}
-
-std::string build_status_report(const std::vector<ServiceState> &services) {
-    std::string out;
-    long long t = now_ms();
+std::string build_status_report(const std::vector<ServiceState> &services,
+                                const std::map<std::string, size_t> &index) {
+    std::string out = "OK\n";
     for (const auto &svc : services) {
-        out += svc.name;
-        if (svc.pid != 0) {
-            out += ": running pid=" + std::to_string(svc.pid) +
-                   " uptime_ms=" + std::to_string(t - svc.start_time_ms);
-        } else if (svc.disabled) {
-            out += ": disabled";
-        } else {
-            long long wait_left = std::max<long long>(0, svc.next_start_ms - t);
-            out += ": stopped next_start_in_ms=" + std::to_string(wait_left) +
-                   " backoff_ms=" + std::to_string(svc.backoff_ms);
-        }
-        out += "\n";
+        out += svc.name + ": ";
+        if (svc.pid) {
+            out += svc.stopping || svc.reaped ? "stopping" : (svc.exec_ok ? "running" : "starting");
+            out += " pid=" + std::to_string(svc.pid);
+        } else if (svc.disabled)
+            out += "disabled";
+        else if (!dependencies_ready(svc, services, index))
+            out += "blocked";
+        else
+            out += "stopped";
+        out += " backoff_ms=" + std::to_string(svc.backoff_ms) +
+               " next_start_in_ms=" + std::to_string(std::max(0LL, svc.next_start_ms - now_ms())) +
+               "\n";
     }
-    if (out.empty()) out = "(no services)\n";
+    if (services.empty())
+        out += "(no services)\n";
     return out;
 }
 
-// pid_to_index нужен, чтобы 'stop'/'restart' сразу помечали слот в карте
-// как свободный, когда убивают ещё не пожатый процесс.
-void handle_client(int client_fd, std::vector<ServiceState> &services,
-                    const std::map<std::string, size_t> &name_to_index) {
-    char buf[256];
-    ssize_t r = recv(client_fd, buf, sizeof(buf) - 1, 0);
-    if (r <= 0) {
-        close(client_fd);
-        return;
-    }
-    buf[r] = '\0';
-
-    std::string line(buf);
-    size_t end = line.find_first_of("\r\n");
-    if (end != std::string::npos) line = line.substr(0, end);
-
-    std::istringstream iss(line);
-    std::string cmd, name;
-    iss >> cmd >> name;
-
-    std::string response;
-    if (cmd == "status") {
-        response = build_status_report(services);
-    } else if (cmd == "stop" || cmd == "start" || cmd == "restart") {
-        auto it = name_to_index.find(name);
-        if (name.empty()) {
-            response = "ERR missing service name\n";
-        } else if (it == name_to_index.end()) {
-            response = "ERR unknown service '" + name + "'\n";
-        } else {
-            ServiceState &svc = services[it->second];
-            if (cmd == "stop") {
-                svc.disabled = true;
-                if (svc.pid != 0) {
-                    svc.manual_action = true;
-                    kill(svc.pid, SIGTERM); // сам реап обработает выход
-                }
-            } else if (cmd == "start") {
-                svc.disabled = false;
-                svc.backoff_ms = 0;
-                svc.next_start_ms = now_ms(); // старт при ближайшей возможности
-            } else { // restart
-                svc.disabled = false;
-                if (svc.pid != 0) {
-                    svc.manual_action = true;
-                    kill(svc.pid, SIGTERM); // респавн подхватит сам после реапа
-                } else {
-                    svc.backoff_ms = 0;
-                    svc.next_start_ms = now_ms();
-                }
-            }
-            response = "OK\n";
+std::string handle_command(const std::string &line, std::vector<ServiceState> &services,
+                           const std::map<std::string, size_t> &index, bool shutting_down) {
+    for (char c : line)
+        if (static_cast<unsigned char>(c) < 32 && c != '\t')
+            return "ERR invalid request bytes\n";
+    std::istringstream in(line);
+    std::string cmd, name, extra;
+    in >> cmd >> name >> extra;
+    if (cmd == "status" && name.empty())
+        return build_status_report(services, index);
+    if ((cmd != "start" && cmd != "stop" && cmd != "restart") || !valid_name(name) ||
+        !extra.empty())
+        return "ERR expected status or start|stop|restart NAME\n";
+    const auto it = index.find(name);
+    if (it == index.end())
+        return "ERR unknown service\n";
+    if (shutting_down)
+        return "ERR supervisor is shutting down\n";
+    auto &svc = services[it->second];
+    if (cmd == "stop") {
+        svc.disabled = true;
+        svc.manual_action = true;
+        request_stop(svc);
+    } else if (cmd == "restart") {
+        svc.disabled = false;
+        svc.manual_action = true;
+        if (svc.pid)
+            request_stop(svc);
+        else {
+            svc.backoff_ms = 0;
+            svc.next_start_ms = now_ms();
         }
-    } else {
-        response = "ERR unknown command '" + cmd + "'\n";
+    } else if (svc.disabled) {
+        svc.disabled = false;
+        svc.manual_action = true;
+        svc.backoff_ms = 0;
+        svc.next_start_ms = now_ms();
     }
-
-    ssize_t written = 0;
-    while (written < static_cast<ssize_t>(response.size())) {
-        ssize_t w = write(client_fd, response.data() + written, response.size() - written);
-        if (w <= 0) break;
-        written += w;
-    }
-    close(client_fd);
+    // Commands acknowledge desired state. Starting while stopping waits for reap.
+    return "OK\n";
 }
 
-} // namespace
-
-int main(int argc, char *argv[]) {
-    std::string services_dir = (argc > 1) ? argv[1] : "/etc/sv";
-    std::string socket_path  = (argc > 2) ? argv[2] : "/run/strazh/supervisor.sock";
-
-    std::fprintf(stderr, "[supervisor] starting as pid %d, services dir: %s\n",
-        getpid(), services_dir.c_str());
-
-    std::vector<ServiceState> services = resolve_order(discover_services(services_dir));
-    if (services.empty()) {
-        std::fprintf(stderr, "[supervisor] no services found in %s\n", services_dir.c_str());
+bool reap_services(std::vector<ServiceState> &services, std::map<pid_t, size_t> &pids) {
+    for (;;) {
+        int status;
+        const pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid < 0 && errno == EINTR)
+            continue;
+        if (pid < 0 && errno != ECHILD) {
+            std::perror("waitpid");
+            return false;
+        }
+        if (pid <= 0)
+            break;
+        const auto it = pids.find(pid);
+        if (it == pids.end())
+            continue;
+        auto &svc = services[it->second];
+        pids.erase(it);
+        svc.reaped = true;
+        svc.exec_ok = false;
+        if (svc.exec_error.get() >= 0)
+            exec_result(svc.exec_error);
+        // The foreground leader is gone. Remove remaining members before
+        // allowing another instance to start, including on natural exits.
+        signal_group(svc.pid, SIGKILL);
+        svc.stop_deadline_ms = now_ms() + kKillGraceMs;
+        if (svc.manual_action) {
+            svc.manual_action = false;
+            svc.backoff_ms = 0;
+            svc.next_start_ms = now_ms();
+        } else {
+            svc.backoff_ms = next_backoff(svc.backoff_ms, now_ms() - svc.start_time_ms);
+            svc.next_start_ms = now_ms() + svc.backoff_ms;
+        }
+        std::fprintf(stderr, "[supervisor] exited %s exit_code=%d signal=%d backoff_ms=%lld\n",
+                     svc.name.c_str(), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                     WIFSIGNALED(status) ? WTERMSIG(status) : 0, svc.backoff_ms);
     }
-    for (const auto &svc : services) {
-        if (!svc.after.empty()) {
-            std::string deps;
-            for (const auto &d : svc.after) { if (!deps.empty()) deps += ", "; deps += d; }
-            std::fprintf(stderr, "[supervisor] %s waits for: %s\n", svc.name.c_str(), deps.c_str());
+    return true;
+}
+
+void update_services(std::vector<ServiceState> &services) {
+    for (auto &svc : services) {
+        if (!svc.pid)
+            continue;
+        if (!svc.reaped && svc.exec_error.get() >= 0) {
+            const int state = exec_result(svc.exec_error);
+            svc.exec_ok = state == 1;
+            if (state < 0)
+                signal_pid(svc.pid, SIGKILL);
+        }
+        if (svc.reaped && !group_exists(svc.pid)) {
+            svc.pid = 0;
+            svc.stopping = false;
+        } else if ((svc.stopping || svc.reaped) && now_ms() >= svc.stop_deadline_ms) {
+            signal_group(svc.pid, SIGKILL);
+            if (!svc.reaped)
+                signal_pid(svc.pid, SIGKILL);
+            // No blocking waitpid, even for uninterruptible kernel sleep.
         }
     }
+}
 
-    std::map<std::string, size_t> name_to_index;
-    for (size_t i = 0; i < services.size(); ++i) name_to_index[services[i].name] = i;
-
-    std::map<pid_t, size_t> pid_to_index;
-
-    int sfd = setup_signalfd();
-    if (sfd == -1) return 1;
-
-    int listen_fd = create_control_socket(socket_path);
-    // Отсутствие control socket — не фатально для первого шага: просто нет
-    // возможности спросить status, супервизор всё равно управляет сервисами.
-    if (listen_fd == -1) {
-        std::fprintf(stderr, "[supervisor] continuing without control socket\n");
-    }
-
-    int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd == -1) {
-        std::perror("epoll_create1");
-        close(sfd);
-        if (listen_fd != -1) close(listen_fd);
-        return 1;
-    }
-    epoll_event ev{};
-    ev.events = EPOLLIN;
-    ev.data.fd = sfd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev) == -1) {
-        std::perror("epoll_ctl");
-        close(epfd);
-        close(sfd);
-        if (listen_fd != -1) close(listen_fd);
-        return 1;
-    }
-    if (listen_fd != -1) {
-        epoll_event lev{};
-        lev.events = EPOLLIN;
-        lev.data.fd = listen_fd;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &lev) == -1) {
-            std::perror("epoll_ctl (listen_fd)");
-            close(listen_fd);
-            listen_fd = -1;
+void start_services(std::vector<ServiceState> &services, const std::map<std::string, size_t> &index,
+                    std::map<pid_t, size_t> &pids) {
+    for (size_t i = 0; i < services.size(); ++i) {
+        auto &svc = services[i];
+        if (!svc.pid && !svc.disabled && now_ms() >= svc.next_start_ms &&
+            dependencies_ready(svc, services, index)) {
+            svc.manual_action = false;
+            if (spawn_service(svc))
+                pids[svc.pid] = i;
         }
     }
+}
 
-    bool shutting_down = false;
-    long long shutdown_deadline_ms = 0;
+int run(int argc, char **argv) {
+    if (argc > 3)
+        throw std::runtime_error("usage: supervisor [SERVICES [SOCKET]]");
+    const std::string services_dir =
+        std::filesystem::canonical(argc > 1 ? argv[1] : "/etc/sv").string();
+    const char *env = std::getenv("STRAZH_SOCKET");
+    const std::string socket_path =
+        argc > 2 ? argv[2] : (env ? env : "/run/strazh/supervisor.sock");
+    Fd directory_lock(open(services_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (directory_lock.get() < 0 || flock(directory_lock.get(), LOCK_EX | LOCK_NB) < 0)
+        throw std::runtime_error("services directory is already supervised or inaccessible");
+    auto services = resolve_order(discover_services(services_dir));
+    ChildReaper cleanup;
+    struct GroupCleanup {
+        std::vector<ServiceState> &services;
+        ~GroupCleanup() {
+            for (auto &svc : services)
+                signal_group(svc.pid, SIGKILL);
+        }
+    } group_cleanup{services};
+    std::map<std::string, size_t> index;
+    for (size_t i = 0; i < services.size(); ++i)
+        index[services[i].name] = i;
+    std::map<pid_t, size_t> pids;
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1) < 0)
+        throw std::runtime_error("subreaper setup failed");
+    Fd sfd(setup_signalfd());
+    Fd epfd(epoll_create1(EPOLL_CLOEXEC));
+    ControlSocket listener(socket_path);
+    if (sfd.get() < 0 || epfd.get() < 0 || !epoll_add(epfd.get(), sfd.get()) ||
+        !epoll_add(epfd.get(), listener.get()))
+        throw std::runtime_error("event setup failed");
+    // Confirm procfs is available before starting anything.
+    children();
+    std::map<int, Client> clients;
+    bool shutting_down = false, killed = false;
+    int result = 0;
+    long long shutdown_deadline = 0;
+    long long accept_resume_ms = 0;
+    std::set<pid_t> term_sent;
+    auto shutdown = [&] {
+        if (shutting_down)
+            return;
+        shutting_down = true;
+        shutdown_deadline = now_ms() + kShutdownGraceMs;
+        for (auto it = services.rbegin(); it != services.rend(); ++it) {
+            request_stop(*it);
+            if (it->pid > 0)
+                term_sent.insert(it->pid);
+        }
+    };
 
     for (;;) {
-        long long timeout_ms = -1;
-        if (shutting_down) {
-            timeout_ms = std::max<long long>(0, shutdown_deadline_ms - now_ms());
-        } else {
-            for (const auto &svc : services) {
-                if (svc.pid != 0 || svc.disabled) continue;
-                long long wait_left;
-                if (dependencies_ready(svc, services, name_to_index)) {
-                    wait_left = svc.next_start_ms - now_ms();
-                    if (wait_left < 0) wait_left = 0;
-                } else {
-                    wait_left = kDependencyPollMs;
-                }
-                if (timeout_ms == -1 || wait_left < timeout_ms) timeout_ms = wait_left;
+        if (accept_resume_ms && now_ms() >= accept_resume_ms) {
+            accept_resume_ms = 0;
+            if (!epoll_add(epfd.get(), listener.get())) {
+                result = 1;
+                shutdown();
             }
         }
-        int epoll_timeout = (timeout_ms < 0) ? -1
-            : static_cast<int>(std::min<long long>(timeout_ms, INT_MAX));
-
-        epoll_event events[8];
-        int n = epoll_wait(epfd, events, 8, epoll_timeout);
-        if (n == -1) {
-            if (errno == EINTR) continue;
+        epoll_event events[32];
+        const int n = epoll_wait(epfd.get(), events, 32, 50);
+        if (n < 0 && errno != EINTR) {
             std::perror("epoll_wait");
-            break;
+            result = 1;
+            shutdown();
         }
-
-        if (n == 0 && shutting_down && now_ms() >= shutdown_deadline_ms) {
-            for (auto &svc : services) {
-                if (svc.pid != 0) {
-                    std::fprintf(stderr, "[supervisor] %s (pid %d) didn't stop in time, SIGKILL\n",
-                        svc.name.c_str(), svc.pid);
-                    kill(svc.pid, SIGKILL);
-                }
+        // Drain signals before commands or timers. Reap regardless of coalesced
+        // SIGCHLD notifications; a signal does not correspond to exactly one child.
+        signalfd_siginfo si{};
+        for (int budget = 0; budget < 64; ++budget) {
+            const ssize_t r = read(sfd.get(), &si, sizeof(si));
+            if (r < 0 && errno == EINTR) {
+                --budget;
+                continue;
             }
-            for (auto &svc : services) {
-                if (svc.pid != 0) {
-                    waitpid(svc.pid, nullptr, 0);
-                    svc.pid = 0;
-                }
+            if (r < 0 && errno == EAGAIN)
+                break;
+            if (r != static_cast<ssize_t>(sizeof(si))) {
+                result = 1;
+                shutdown();
+                break;
             }
-            break;
+            if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT)
+                shutdown();
         }
+        if (!reap_services(services, pids)) {
+            result = 1;
+            shutdown();
+        }
+        update_services(services);
 
         for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
-
-            if (fd == listen_fd) {
-                int client_fd = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
-                if (client_fd != -1) {
-                    handle_client(client_fd, services, name_to_index);
+            const int fd = events[i].data.fd;
+            if (fd == listener.get()) {
+                for (int budget = 0; budget < 16; ++budget) {
+                    Fd incoming(accept4(fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK));
+                    if (incoming.get() < 0) {
+                        if (errno == EINTR) {
+                            --budget;
+                            continue;
+                        }
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                            std::perror("accept4");
+                            // A readable listener plus EMFILE would otherwise
+                            // make epoll return immediately in a tight loop.
+                            epoll_ctl(epfd.get(), EPOLL_CTL_DEL, fd, nullptr);
+                            accept_resume_ms = now_ms() + 250;
+                        }
+                        break;
+                    }
+                    ucred peer{};
+                    socklen_t length = sizeof(peer);
+                    if (clients.size() >= 64 ||
+                        getsockopt(incoming.get(), SOL_SOCKET, SO_PEERCRED, &peer, &length) < 0 ||
+                        (peer.uid != geteuid() && peer.uid != 0))
+                        continue;
+                    const int key = incoming.get();
+                    if (!epoll_add(epfd.get(), key, EPOLLIN | EPOLLRDHUP))
+                        continue;
+                    clients.emplace(
+                        key, Client{std::move(incoming), {}, {}, 0, now_ms() + kClientTimeoutMs});
                 }
                 continue;
             }
-
-            if (fd != sfd) continue; // неизвестный fd, не должно происходить
-
-            signalfd_siginfo si{};
-            ssize_t r = read(sfd, &si, sizeof(si));
-            if (r != static_cast<ssize_t>(sizeof(si))) continue;
-
-            if (si.ssi_signo == SIGTERM && !shutting_down) {
-                std::fprintf(stderr, "[supervisor] got SIGTERM, stopping all services (grace %lld ms)\n",
-                    kShutdownGraceMs);
-                shutting_down = true;
-                shutdown_deadline_ms = now_ms() + kShutdownGraceMs;
-                for (auto &svc : services) {
-                    if (svc.pid != 0) kill(svc.pid, SIGTERM);
-                }
+            const auto it = clients.find(fd);
+            if (it == clients.end())
                 continue;
+            auto &client = it->second;
+            bool close_client = (events[i].events & EPOLLERR) != 0;
+            if (!close_client) {
+                close_client = !pump_client(client, [&](const std::string &line) {
+                    return handle_command(line, services, index, shutting_down);
+                });
+                if (!close_client && !client.output.empty()) {
+                    epoll_event ev{};
+                    ev.events = EPOLLOUT;
+                    ev.data.fd = fd;
+                    if (epoll_ctl(epfd.get(), EPOLL_CTL_MOD, fd, &ev) < 0)
+                        close_client = true;
+                }
             }
-
-            if (si.ssi_signo != SIGCHLD) continue;
-
-            for (;;) {
-                int status = 0;
-                pid_t pid = waitpid(-1, &status, WNOHANG);
-                if (pid <= 0) break;
-
-                auto it = pid_to_index.find(pid);
-                if (it == pid_to_index.end()) {
-                    std::fprintf(stderr, "[supervisor] reaped untracked pid %d\n", pid);
-                    continue;
-                }
-                ServiceState &svc = services[it->second];
-                pid_to_index.erase(it);
-
-                long long ran_ms = now_ms() - svc.start_time_ms;
-                if (WIFEXITED(status)) {
-                    std::fprintf(stderr, "[supervisor] %s (pid %d) exited with code %d after %lld ms\n",
-                        svc.name.c_str(), pid, WEXITSTATUS(status), ran_ms);
-                } else if (WIFSIGNALED(status)) {
-                    std::fprintf(stderr, "[supervisor] %s (pid %d) killed by signal %d after %lld ms\n",
-                        svc.name.c_str(), pid, WTERMSIG(status), ran_ms);
-                }
-                svc.pid = 0;
-
-                if (shutting_down) continue;
-
-                if (svc.manual_action) {
-                    svc.manual_action = false;
-                    svc.backoff_ms = 0;
-                    svc.next_start_ms = now_ms(); // команда, не краш — без штрафа
-                } else if (ran_ms < kMinRuntimeMs) {
-                    svc.backoff_ms = (svc.backoff_ms == 0)
-                        ? kInitialBackoffMs
-                        : std::min(svc.backoff_ms * 2, kMaxBackoffMs);
-                    std::fprintf(stderr, "[supervisor] %s crashed fast, backing off %lld ms\n",
-                        svc.name.c_str(), svc.backoff_ms);
-                    svc.next_start_ms = now_ms() + svc.backoff_ms;
-                } else {
-                    svc.backoff_ms = 0;
-                    svc.next_start_ms = now_ms();
-                }
+            if (close_client) {
+                epoll_ctl(epfd.get(), EPOLL_CTL_DEL, fd, nullptr);
+                clients.erase(it);
             }
         }
-
+        for (auto it = clients.begin(); it != clients.end();) {
+            if (now_ms() >= it->second.deadline) {
+                epoll_ctl(epfd.get(), EPOLL_CTL_DEL, it->first, nullptr);
+                it = clients.erase(it);
+            } else
+                ++it;
+        }
+        // Deadlines are checked on every turn, even with constant client traffic.
         if (shutting_down) {
-            bool all_stopped = true;
-            for (const auto &svc : services) {
-                if (svc.pid != 0) { all_stopped = false; break; }
+            if (killed)
+                signal_children(SIGKILL);
+            else
+                signal_new_children(SIGTERM, term_sent);
+            if (pids.empty() && children().empty())
+                return result;
+            if (now_ms() >= shutdown_deadline) {
+                if (killed) {
+                    std::fprintf(stderr, "[supervisor] SIGKILL deadline exceeded\n");
+                    return 1;
+                }
+                killed = true;
+                for (auto &svc : services)
+                    signal_group(svc.pid, SIGKILL);
+                signal_children(SIGKILL);
+                shutdown_deadline = now_ms() + kKillGraceMs;
             }
-            if (all_stopped) break;
             continue;
         }
-
-        long long t = now_ms();
-        for (auto &svc : services) {
-            if (svc.pid == 0 && !svc.disabled && svc.next_start_ms <= t &&
-                dependencies_ready(svc, services, name_to_index)) {
-                if (spawn_service(svc)) {
-                    pid_to_index[svc.pid] = &svc - &services[0];
-                }
-            }
-        }
+        start_services(services, index, pids);
     }
+}
+} // namespace
 
-    close(epfd);
-    close(sfd);
-    if (listen_fd != -1) {
-        close(listen_fd);
-        unlink(socket_path.c_str());
+int main(int argc, char **argv) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[supervisor] fatal: %s\n", e.what());
+        return 1;
     }
-    std::fprintf(stderr, "[supervisor] all services stopped, exiting\n");
-    return 0;
 }
