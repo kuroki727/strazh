@@ -13,7 +13,7 @@ int main() {
     sigset_t mask;
     if (sigprocmask(SIG_SETMASK, nullptr, &mask) < 0)
         return 90;
-    struct sigaction action{};
+    struct sigaction action {};
     if (sigaction(SIGPIPE, nullptr, &action) < 0)
         return 91;
     strazh::Fd fd(open("events", O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600));

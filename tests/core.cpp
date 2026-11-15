@@ -39,9 +39,7 @@ struct Fixture {
     ~Fixture() {
         for (auto &svc : services)
             signal_group(svc.pid, SIGKILL);
-        {
-            ChildReaper cleanup;
-        }
+        { ChildReaper cleanup; }
         std::filesystem::remove_all(root);
     }
     std::string add(const std::string &name, const std::string &mode = "hold",
@@ -188,7 +186,7 @@ void failed_exec_and_fork(const std::string &helper) {
     check(f.events("dep").empty() && f.svc("dep").pid == 0, "failed exec released dependency");
     f.command("stop bad");
     f.until([&] { return f.svc("bad").pid == 0; });
-    struct rlimit original{};
+    struct rlimit original {};
     check(getrlimit(RLIMIT_NOFILE, &original) == 0, "getrlimit");
     auto limited = original;
     limited.rlim_cur = 3;

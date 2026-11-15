@@ -31,7 +31,7 @@ struct ServiceState {
 
 std::vector<std::string> read_after_file(const std::string &path) {
     std::vector<std::string> deps;
-    struct stat st{};
+    struct stat st {};
     if (stat(path.c_str(), &st) < 0) {
         if (errno == ENOENT)
             return deps;
@@ -93,7 +93,7 @@ std::vector<ServiceState> discover_services(const std::string &services_dir) {
             continue;
 
         std::string run_path = services_dir + "/" + name + "/run";
-        struct stat st{};
+        struct stat st {};
         if (stat(run_path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
             continue;
         }

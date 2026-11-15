@@ -19,7 +19,7 @@ constexpr Mount mounts[] = {{"/proc", "proc", PROC_SUPER_MAGIC, MS_NOSUID | MS_N
                             {"/run", "tmpfs", TMPFS_MAGIC, MS_NOSUID | MS_NODEV}};
 
 bool directory(const std::string &path) {
-    struct stat st{};
+    struct stat st {};
     return lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
@@ -40,8 +40,9 @@ std::string mounted_type(const char *target) {
 }
 
 bool ensure_mount(const Mount &m) {
-    struct statfs fs{};
-    struct statx point{}, parent{};
+    struct statfs fs {};
+    struct statx point {};
+    struct statx parent {};
     // Mount IDs detect bind mounts too, including ones on the same filesystem.
     // Fail closed when the kernel cannot establish whether a mount exists.
     if (statfs(m.target, &fs) < 0 ||
@@ -101,7 +102,7 @@ int main(int argc, char **argv) {
         std::perror("[stage1] mkdir /run/strazh");
         return 1;
     }
-    struct stat st{};
+    struct stat st {};
     if (lstat("/run/strazh", &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0 ||
         (st.st_mode & 0077) != 0) {
         std::fprintf(stderr, "[stage1] /run/strazh must be a root-owned private directory\n");

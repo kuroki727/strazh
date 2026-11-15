@@ -89,6 +89,9 @@ ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
 ASan and UBSan can be enabled independently. Tests additionally need Python 3.8+
 (standard library only) and compiler thread support for a socket-pair fixture.
 Warnings include conversion, sign conversion, shadowing, pedantic and format checks.
+Source formatting is pinned to clang-format 18 in CI; formatter major versions
+can differ. With clang-format 18 installed, check tracked C++ files using
+`git ls-files -z '*.cpp' '*.h' | xargs -0 clang-format-18 --dry-run --Werror`.
 LeakSanitizer needs permission to inspect processes with ptrace. In restricted
 sandboxes, `ASAN_OPTIONS=detect_leaks=0:abort_on_error=1` allows ASan/UBSan checks;
 this does not verify leaks. Do not change host kernel settings to run tests.

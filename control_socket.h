@@ -82,7 +82,7 @@ template <class Command> bool pump_client(Client &client, Command command) {
 class ControlSocket {
     Fd parent_, lock_, socket_;
     std::string name_;
-    struct stat identity_{};
+    struct stat identity_ {};
 
   public:
     explicit ControlSocket(const std::string &path) {
@@ -93,7 +93,7 @@ class ControlSocket {
             throw std::runtime_error("socket needs an absolute path without symlink parents");
         parent_.reset(
             open(p.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
-        struct stat st{};
+        struct stat st {};
         if (parent_.get() < 0 || fstat(parent_.get(), &st) < 0 || st.st_uid != geteuid() ||
             (st.st_mode & 0022) != 0)
             throw std::runtime_error(
@@ -118,7 +118,7 @@ class ControlSocket {
                 errno != ECONNREFUSED)
                 throw std::runtime_error(
                     "socket is active or cannot safely be identified as stale");
-            struct stat current{};
+            struct stat current {};
             if (fstatat(parent_.get(), name_.c_str(), &current, AT_SYMLINK_NOFOLLOW) < 0 ||
                 current.st_dev != st.st_dev || current.st_ino != st.st_ino ||
                 unlinkat(parent_.get(), name_.c_str(), 0) < 0)
@@ -155,7 +155,7 @@ class ControlSocket {
 
   private:
     void cleanup() {
-        struct stat st{};
+        struct stat st {};
         if (identity_.st_ino &&
             fstatat(parent_.get(), name_.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
             st.st_dev == identity_.st_dev && st.st_ino == identity_.st_ino && S_ISSOCK(st.st_mode))

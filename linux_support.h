@@ -64,7 +64,7 @@ inline int setup_signalfd() {
         sigaddset(&mask, sig);
     if (sigprocmask(SIG_BLOCK, &mask, nullptr) < 0)
         return -1;
-    struct sigaction action{};
+    struct sigaction action {};
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
     for (int sig : {SIGCHLD, SIGTERM, SIGINT}) {
@@ -82,7 +82,7 @@ inline bool epoll_add(int epfd, int fd, unsigned events = EPOLLIN) {
 }
 
 inline bool reset_child_signals() {
-    struct sigaction action{};
+    struct sigaction action {};
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
     for (int sig = 1; sig < NSIG; ++sig) {
